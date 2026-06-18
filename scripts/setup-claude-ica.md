@@ -27,11 +27,47 @@ The real token file lives under `~/.headroom/` and is **never committed**
 
 ## 2. Start the proxy
 
+### Option A — Docker (recommended)
+
+Build the image once from this fork (it runs the Python proxy, where the
+rotation lives):
+
+```sh
+docker build --target runtime -t headroom-ica:local .
+```
+
+Then run it. The keys file is mounted **read-only** into the container — the
+tokens never enter the image, only your host file:
+
+```sh
+scripts/run-ica-docker.sh
+```
+
+which is equivalent to:
+
+```sh
+docker run -d --name headroom-ica --restart unless-stopped \
+  -p 8787:8787 \
+  -v "$HOME/.headroom/ica_tokens.txt:/home/nonroot/.headroom/ica_tokens.txt:ro" \
+  -e HEADROOM_TELEMETRY=off \
+  headroom-ica:local \
+  --host 0.0.0.0 --port 8787 \
+  --anthropic-api-url https://api.nextgen-beta.ica.ibm.com/ica \
+  --auth-token-file /home/nonroot/.headroom/ica_tokens.txt \
+  --auth-token-cooldown 3600
+```
+
+To change keys: edit `~/.headroom/ica_tokens.txt` and re-run
+`scripts/run-ica-docker.sh` (it recreates the container so the file is re-read).
+Logs: `docker logs -f headroom-ica`. Stop: `docker rm -f headroom-ica`.
+
+### Option B — local process (no Docker)
+
 ```sh
 scripts/run-ica-proxy.sh
 ```
 
-This runs (telemetry off):
+which runs (telemetry off):
 
 ```sh
 headroom proxy \

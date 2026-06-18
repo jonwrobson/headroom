@@ -34,6 +34,7 @@ scripts/*
 !scripts/export_kompress_v2_onnx.py
 # IBM ICA auth-token-rotation helpers (no secrets; the real token file stays ignored).
 !scripts/run-ica-proxy.sh
+!scripts/run-ica-docker.sh
 !scripts/setup-claude-ica.md
 !scripts/ica_tokens.txt.example
 
