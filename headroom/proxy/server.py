@@ -646,6 +646,32 @@ class HeadroomProxy(
         self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
         self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
+        # Auth-token pool: when an auth-token file is configured, the proxy owns
+        # the list of upstream tokens and rotates through them on spend-limit
+        # errors (see headroom/proxy/auth_token_pool.py). Unset → passthrough.
+        self.auth_token_pool = None
+        if config.auth_token_file:
+            from headroom.proxy.auth_token_pool import TokenPool
+
+            try:
+                self.auth_token_pool = TokenPool.from_file(
+                    config.auth_token_file,
+                    cooldown_s=config.auth_token_cooldown_s,
+                )
+                logger.info(
+                    "Auth-token rotation enabled: %d token(s) from %s (cooldown %ds)",
+                    len(self.auth_token_pool),
+                    config.auth_token_file,
+                    config.auth_token_cooldown_s,
+                )
+            except OSError as e:
+                logger.error(
+                    "Auth-token file %s could not be read (%s); "
+                    "falling back to header passthrough",
+                    config.auth_token_file,
+                    e,
+                )
+
         # `metrics` is hoisted ahead of transform construction so the
         # transforms can receive `self.metrics` as their compression
         # observer at __init__ time. The forcing function for catching
@@ -1849,6 +1875,96 @@ class HeadroomProxy(
                 "retry loop exhausted with no error recorded; retry_max_attempts must be >= 1"
             )
         raise last_error
+
+    # ------------------------------------------------------------------
+    # Auth-token pool rotation (spend-limit failover)
+    # ------------------------------------------------------------------
+
+    def _apply_pool_token(self, headers: dict, token: str) -> dict:
+        """Return a copy of ``headers`` with the Authorization set to ``token``.
+
+        Any client-supplied ``Authorization`` / ``x-api-key`` is dropped so the
+        proxy's pooled token is authoritative (case-insensitive).
+        """
+        new = {
+            k: v for k, v in headers.items() if k.lower() not in ("authorization", "x-api-key")
+        }
+        new["authorization"] = f"Bearer {token}"
+        return new
+
+    def _response_is_spend_limited(self, response: httpx.Response) -> bool:
+        """Whether an upstream response signals the current token is over budget."""
+        from headroom.proxy.auth_token_pool import is_spend_limit_error
+
+        try:
+            body = response.json()
+        except Exception:
+            return False
+        return is_spend_limit_error(
+            response.status_code,
+            body,
+            error_types=self.config.spend_limit_error_types,
+            match=self.config.spend_limit_match,
+        )
+
+    def _all_tokens_exhausted_response(
+        self, last_response: httpx.Response | None
+    ) -> httpx.Response:
+        """Synthesize the client-facing error when every token is exhausted."""
+        message = "All upstream auth tokens have hit their spend limits."
+        if last_response is not None:
+            try:
+                upstream_msg = last_response.json().get("error", {}).get("message", "")
+                if upstream_msg:
+                    message += f" Last upstream error: {upstream_msg}"
+            except Exception:
+                pass
+        message += f" Retry after the cooldown ({self.config.auth_token_cooldown_s}s)."
+        return httpx.Response(
+            429,
+            json={
+                "type": "error",
+                "error": {"type": "all_tokens_exhausted", "message": message},
+            },
+        )
+
+    async def _retry_request_with_token_rotation(
+        self,
+        method: str,
+        url: str,
+        headers: dict,
+        body: dict,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """``_retry_request`` wrapper that rotates auth tokens on spend limits.
+
+        When no token pool is configured this is a transparent passthrough to
+        ``_retry_request`` (today's behavior). Otherwise it overrides the
+        Authorization header with the current pooled token and, on a spend-limit
+        error, marks that token exhausted and retries with the next one. Only
+        when every token is exhausted does it return a synthetic ``429`` so the
+        client learns we ran out — every other response (success or genuine
+        error) is returned unchanged.
+        """
+        pool = getattr(self, "auth_token_pool", None)
+        if pool is None or len(pool) == 0:
+            return await self._retry_request(method, url, headers, body, **kwargs)
+
+        last_spend_response: httpx.Response | None = None
+        # Bounded by the token count: each iteration consumes one fresh token.
+        for _ in range(len(pool)):
+            token = pool.current()
+            if token is None:
+                break
+            attempt_headers = self._apply_pool_token(headers, token)
+            response = await self._retry_request(method, url, attempt_headers, body, **kwargs)
+            if self._response_is_spend_limited(response):
+                pool.mark_exhausted(token)
+                last_spend_response = response
+                continue
+            return response
+
+        return self._all_tokens_exhausted_response(last_spend_response)
 
 
 async def _log_toin_stats_periodically(interval_seconds: int = 300) -> None:
@@ -4173,6 +4289,8 @@ def _proxy_config_from_env() -> ProxyConfig:
             600,
             min_value=1,
         ),
+        auth_token_file=os.environ.get("HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE"),
+        auth_token_cooldown_s=_get_env_int("HEADROOM_AUTH_TOKEN_COOLDOWN_S", 3600),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -4794,6 +4912,10 @@ if __name__ == "__main__":
             args.anthropic_buffered_request_timeout_seconds,
             min_value=1,
         ),
+        auth_token_file=os.environ.get(
+            "HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE", getattr(args, "auth_token_file", None)
+        ),
+        auth_token_cooldown_s=_get_env_int("HEADROOM_AUTH_TOKEN_COOLDOWN_S", 3600),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]

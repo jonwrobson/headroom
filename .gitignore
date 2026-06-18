@@ -32,6 +32,10 @@ scripts/*
 !scripts/audit_wheel_glibc_symbols.py
 !scripts/replay_codex_ws_load.py
 !scripts/export_kompress_v2_onnx.py
+# IBM ICA auth-token-rotation helpers (no secrets; the real token file stays ignored).
+!scripts/run-ica-proxy.sh
+!scripts/setup-claude-ica.md
+!scripts/ica_tokens.txt.example
 
 # Rust / Cargo build artifacts
 /target/
@@ -253,3 +257,8 @@ uv.lock
 /headroom/_core.*.so
 /headroom/_core.so
 .tokensave
+
+# Auth-token pool secrets (never commit real tokens). The .example is fine.
+scripts/ica_tokens.txt
+*ica_tokens.txt
+.headroom/

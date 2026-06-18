@@ -755,6 +755,25 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Custom Anthropic API URL for passthrough endpoints (env: ANTHROPIC_TARGET_API_URL)",
 )
 @click.option(
+    "--auth-token-file",
+    default=None,
+    help=(
+        "Path to a file of upstream auth tokens (one per line). The proxy "
+        "overrides the outbound Authorization header with the current token and "
+        "rotates to the next on a spend-limit error, only failing once all are "
+        "exhausted (env: HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE)."
+    ),
+)
+@click.option(
+    "--auth-token-cooldown",
+    type=int,
+    default=None,
+    help=(
+        "Seconds to skip a spend-exhausted token before retrying it "
+        "(default: 3600; env: HEADROOM_AUTH_TOKEN_COOLDOWN_S)."
+    ),
+)
+@click.option(
     "--openai-api-url",
     default=None,
     help="Custom OpenAI API URL for passthrough endpoints (env: OPENAI_TARGET_API_URL)",
@@ -901,6 +920,8 @@ def proxy(
     backend: str,
     anyllm_provider: str,
     anthropic_api_url: str | None,
+    auth_token_file: str | None,
+    auth_token_cooldown: int | None,
     openai_api_url: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
@@ -1067,6 +1088,15 @@ def proxy(
         host=host,
         port=port,
         anthropic_api_url=provider_api_overrides.anthropic,
+        # Auth-token pool / spend-limit rotation. CLI flag > env > unset.
+        auth_token_file=(
+            auth_token_file or os.environ.get("HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE") or None
+        ),
+        auth_token_cooldown_s=(
+            auth_token_cooldown
+            if auth_token_cooldown is not None
+            else _get_env_int_optional("HEADROOM_AUTH_TOKEN_COOLDOWN_S") or 3600
+        ),
         openai_api_url=provider_api_overrides.openai,
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,

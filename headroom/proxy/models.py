@@ -251,6 +251,19 @@ class ProxyConfig:
     retry_base_delay_ms: int = 1000
     retry_max_delay_ms: int = 30000
 
+    # Auth-token pool / spend-limit rotation.
+    # When ``auth_token_file`` is set, the proxy loads a list of upstream auth
+    # tokens (one per line) and overrides the outbound Authorization header with
+    # the current token. On a spend-limit error (see ``spend_limit_*`` below) it
+    # rotates to the next token and retries; only when every token is exhausted
+    # does the client see an error. Unset = today's passthrough behavior.
+    auth_token_file: str | None = None
+    auth_token_cooldown_s: int = 3600
+    # ``error.type`` values that mark a token as spend-exhausted, and a
+    # case-insensitive substring fallback matched against ``error.message``.
+    spend_limit_error_types: set[str] = field(default_factory=lambda: {"budget_exceeded"})
+    spend_limit_match: str | None = "budget has been exceeded"
+
     # Prefix freeze
     prefix_freeze_enabled: bool = True
     prefix_freeze_session_ttl: int = 600

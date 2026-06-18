@@ -2267,7 +2267,10 @@ class AnthropicHandlerMixin:
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
-                        response = await self._retry_request(
+                        # Rotates through the auth-token pool on spend-limit
+                        # errors when configured; otherwise a passthrough to
+                        # _retry_request (header forwarding unchanged).
+                        response = await self._retry_request_with_token_rotation(
                             "POST",
                             url,
                             headers,

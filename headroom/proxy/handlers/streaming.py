@@ -1031,88 +1031,160 @@ class StreamingMixin:
         # Open connection before generator to capture upstream response headers
         # (needed to forward ratelimit headers to the client via StreamingResponse)
         assert self.http_client is not None, "http_client must be initialized before streaming"
-        try:
-            retry_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
-            upstream_response = None
-            last_connect_error = None
 
-            for attempt in range(retry_attempts):
-                try:
-                    _upstream_req = self.http_client.build_request(
-                        "POST", url, content=outbound_bytes, headers=outbound_headers
-                    )
-                    upstream_response = await self.http_client.send(_upstream_req, stream=True)
-                    if _codex_wire_debug:
-                        capture_codex_wire_debug(
-                            "http_stream_upstream_response_headers",
-                            request_id=request_id,
-                            transport="http_sse",
-                            direction="upstream_to_headroom",
-                            method="POST",
-                            url=url,
-                            headers=dict(upstream_response.headers),
-                            status_code=upstream_response.status_code,
+        # Auth-token pool: when configured, override the outbound Authorization
+        # with the current pooled token and rotate to the next on a spend-limit
+        # error, only failing once all are exhausted. Detection reads the (small)
+        # error body before any client bytes flow, so a successful stream is
+        # never touched. When no pool is set, this loop runs exactly once with
+        # the headers unchanged (today's behavior).
+        from headroom.proxy.auth_token_pool import is_spend_limit_error
+
+        _pool = getattr(self, "auth_token_pool", None)
+        _pool_active = bool(_pool) and len(_pool) > 0
+        _token_loop_max = len(_pool) if _pool_active else 1
+        _last_spend_msg = ""
+        upstream_response = None
+
+        for _token_attempt in range(_token_loop_max):
+            _pool_token = None
+            if _pool_active:
+                _pool_token = _pool.current()
+                if _pool_token is None:
+                    break
+                outbound_headers = self._apply_pool_token(outbound_headers, _pool_token)
+            try:
+                retry_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
+                upstream_response = None
+                last_connect_error = None
+
+                for attempt in range(retry_attempts):
+                    try:
+                        _upstream_req = self.http_client.build_request(
+                            "POST", url, content=outbound_bytes, headers=outbound_headers
                         )
-                    # Retry transient overloads (429 rate-limit, 529 overloaded)
-                    # honoring Retry-After — the streaming sibling of the
-                    # _retry_request path (#1221); on exhaustion, fall through to
-                    # forward the status to the client.
-                    if (
-                        upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
-                        and self.config.retry_enabled
-                        and attempt < retry_attempts - 1
-                    ):
-                        delay_with_jitter = retry_after_ms(
-                            upstream_response, self.config.retry_max_delay_ms
-                        ) or jitter_delay_ms(
+                        upstream_response = await self.http_client.send(
+                            _upstream_req, stream=True
+                        )
+                        if _codex_wire_debug:
+                            capture_codex_wire_debug(
+                                "http_stream_upstream_response_headers",
+                                request_id=request_id,
+                                transport="http_sse",
+                                direction="upstream_to_headroom",
+                                method="POST",
+                                url=url,
+                                headers=dict(upstream_response.headers),
+                                status_code=upstream_response.status_code,
+                            )
+                        # Retry transient overloads (429 rate-limit, 529
+                        # overloaded) honoring Retry-After — the streaming
+                        # sibling of the _retry_request path (#1221); on
+                        # exhaustion, fall through to forward the status (or let
+                        # the spend-limit failover below rotate the token).
+                        if (
+                            upstream_response.status_code in RETRYABLE_OVERLOAD_STATUSES
+                            and self.config.retry_enabled
+                            and attempt < retry_attempts - 1
+                        ):
+                            delay_with_jitter = retry_after_ms(
+                                upstream_response, self.config.retry_max_delay_ms
+                            ) or jitter_delay_ms(
+                                self.config.retry_base_delay_ms,
+                                self.config.retry_max_delay_ms,
+                                attempt,
+                            )
+                            await upstream_response.aclose()
+                            logger.warning(
+                                f"[{request_id}] Upstream {upstream_response.status_code} "
+                                f"(attempt {attempt + 1}/{retry_attempts}), "
+                                f"retrying in {delay_with_jitter:.0f}ms"
+                            )
+                            await asyncio.sleep(delay_with_jitter / 1000)
+                            continue
+                        break
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                        last_connect_error = e
+                        if attempt >= retry_attempts - 1:
+                            raise
+
+                        delay_with_jitter = jitter_delay_ms(
                             self.config.retry_base_delay_ms,
                             self.config.retry_max_delay_ms,
                             attempt,
                         )
-                        await upstream_response.aclose()
                         logger.warning(
-                            f"[{request_id}] Upstream {upstream_response.status_code} "
-                            f"(attempt {attempt + 1}/{retry_attempts}), "
+                            f"[{request_id}] Connection error to upstream API "
+                            f"(attempt {attempt + 1}/{retry_attempts}): {e!r}; "
                             f"retrying in {delay_with_jitter:.0f}ms"
                         )
                         await asyncio.sleep(delay_with_jitter / 1000)
-                        continue
-                    break
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-                    last_connect_error = e
-                    if attempt >= retry_attempts - 1:
-                        raise
 
-                    delay_with_jitter = jitter_delay_ms(
-                        self.config.retry_base_delay_ms,
-                        self.config.retry_max_delay_ms,
-                        attempt,
-                    )
-                    logger.warning(
-                        f"[{request_id}] Connection error to upstream API "
-                        f"(attempt {attempt + 1}/{retry_attempts}): {e!r}; "
-                        f"retrying in {delay_with_jitter:.0f}ms"
-                    )
-                    await asyncio.sleep(delay_with_jitter / 1000)
+                if upstream_response is None:
+                    raise last_connect_error or RuntimeError("upstream connection did not start")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                error_msg = str(e) or repr(e)
+                logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
 
-            if upstream_response is None:
-                raise last_connect_error or RuntimeError("upstream connection did not start")
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-            error_msg = str(e) or repr(e)
-            logger.error(f"[{request_id}] Connection error to upstream API: {error_msg}")
+                # error_msg bound as a default arg: this closure lives inside the
+                # token-rotation loop, so binding the loop-scoped variable avoids
+                # B023 (and is correct — the generator is returned immediately).
+                async def _error_gen(error_msg=error_msg):
+                    error_event = {
+                        "type": "error",
+                        "error": {
+                            "type": "connection_error",
+                            "message": f"Failed to connect to upstream API: {error_msg}",
+                        },
+                    }
+                    yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
 
-            async def _error_gen():
-                error_event = {
-                    "type": "error",
-                    "error": {
-                        "type": "connection_error",
-                        "message": f"Failed to connect to upstream API: {error_msg}",
-                    },
-                }
-                yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode()
+                self._cleanup_mid_turn_stream(session_key)
+                return StreamingResponse(_error_gen(), media_type="text/event-stream")
 
-            self._cleanup_mid_turn_stream(session_key)
-            return StreamingResponse(_error_gen(), media_type="text/event-stream")
+            # Spend-limit failover. On an error status, peek the body (httpx
+            # caches it, so the existing >=400 handler below can re-read it for
+            # a genuine error). If it is a budget error and a pool is active,
+            # mark this token exhausted and retry with the next one.
+            if _pool_active and upstream_response.status_code >= 400:
+                try:
+                    _peek = await upstream_response.aread()
+                    _peek_json = json.loads(_peek)
+                except Exception:
+                    _peek_json = None
+                if is_spend_limit_error(
+                    upstream_response.status_code,
+                    _peek_json,
+                    error_types=self.config.spend_limit_error_types,
+                    match=self.config.spend_limit_match,
+                ):
+                    _pool.mark_exhausted(_pool_token)
+                    if isinstance(_peek_json, dict):
+                        _last_spend_msg = _peek_json.get("error", {}).get("message", "")
+                    await upstream_response.aclose()
+                    upstream_response = None
+                    continue
+            # Usable response (success or a non-budget error) — stop rotating.
+            break
+
+        # Every pooled token is over budget — tell the client we ran out. This
+        # is the only failure the user sees, per the rotation contract.
+        if _pool_active and upstream_response is None:
+            message = "All upstream auth tokens have hit their spend limits."
+            if _last_spend_msg:
+                message += f" Last upstream error: {_last_spend_msg}"
+            message += f" Retry after the cooldown ({self.config.auth_token_cooldown_s}s)."
+            logger.warning("[%s] auth-token pool exhausted: %s", request_id, message)
+            return Response(
+                content=json.dumps(
+                    {
+                        "type": "error",
+                        "error": {"type": "all_tokens_exhausted", "message": message},
+                    }
+                ).encode(),
+                status_code=429,
+                media_type="application/json",
+            )
 
         # Capture Codex rate-limit window data from the upstream response
         # headers, for *every* status. Codex (gpt-5.x) almost always streams, so

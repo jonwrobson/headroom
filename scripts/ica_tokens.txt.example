@@ -1,0 +1,11 @@
+# Headroom IBM ICA auth-token pool — one ANTHROPIC_AUTH_TOKEN per line.
+#
+# Copy this file to ~/.headroom/ica_tokens.txt and replace the placeholders
+# with your real tokens. Order = rotation priority (first usable token wins).
+# Blank lines and lines starting with '#' are ignored.
+#
+# The real token file MUST NOT be committed — keep it under ~/.headroom/.
+#
+sk-your-first-token-here
+sk-your-second-token-here
+sk-your-third-token-here
