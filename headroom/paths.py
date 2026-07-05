@@ -50,6 +50,7 @@ HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
 HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_COST_PATH_ENV = "HEADROOM_COST_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -60,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_COST_FILE = "proxy_cost.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -207,6 +209,20 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
         explicit,
         HEADROOM_SAVINGS_PATH_ENV,
         workspace_dir() / _SAVINGS_FILE,
+    )
+
+
+def cost_state_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the proxy cost/token tracker state JSON.
+
+    Workspace state: actively written by the running proxy so cost and token
+    totals survive a restart/re-deploy. Defaults to ``~/.headroom/proxy_cost.json``.
+    """
+
+    return _resolve(
+        explicit,
+        HEADROOM_COST_PATH_ENV,
+        workspace_dir() / _COST_FILE,
     )
 
 
@@ -395,11 +411,13 @@ __all__ = [
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
+    "HEADROOM_COST_PATH_ENV",
     "config_dir",
     "workspace_dir",
     "ensure_config_dir",
     "ensure_workspace_dir",
     "savings_path",
+    "cost_state_path",
     "toin_path",
     "subscription_state_path",
     "memory_db_path",

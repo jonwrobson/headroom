@@ -69,6 +69,7 @@ class PrometheusMetrics:
         cost_tracker: CostTracker | None = None,
         otel_metrics: HeadroomOtelMetrics | None = None,
         stateless: bool = False,
+        cost_tracker_persistent: bool = False,
     ):
         # Stateless mode: keep live in-memory metrics but never write the
         # durable savings files (proxy_savings.json, savings_events.jsonl).
@@ -242,15 +243,37 @@ class PrometheusMetrics:
         self.savings_history: list[tuple[str, int]] = []
         self.savings_tracker = savings_tracker or SavingsTracker(stateless=stateless)
         self.cost_tracker = cost_tracker
+        # The savings-lifetime offset bridges the gap when the cost tracker is
+        # ephemeral (reset to 0 each process): it carries forward the persisted
+        # cumulative so ``offset + this-process cost`` is the all-time total.
+        # But when the cost tracker itself persists, it reloads that same
+        # history, so adding the offset would double-count (and compound every
+        # restart). In that case the cost tracker is the sole source of truth
+        # and the offset must be 0.
+        self._cost_tracker_persistent = cost_tracker_persistent
         tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
-        self._savings_tracker_input_tokens_offset = max(
-            int(tracker_lifetime.get("total_input_tokens", 0) or 0),
-            0,
-        )
-        self._savings_tracker_input_cost_usd_offset = max(
-            float(tracker_lifetime.get("total_input_cost_usd", 0.0) or 0.0),
-            0.0,
-        )
+        if cost_tracker_persistent:
+            self._savings_tracker_input_tokens_offset = 0
+            self._savings_tracker_input_cost_usd_offset = 0.0
+            self._savings_tracker_output_tokens_offset = 0
+            self._savings_tracker_output_cost_usd_offset = 0.0
+        else:
+            self._savings_tracker_input_tokens_offset = max(
+                int(tracker_lifetime.get("total_input_tokens", 0) or 0),
+                0,
+            )
+            self._savings_tracker_input_cost_usd_offset = max(
+                float(tracker_lifetime.get("total_input_cost_usd", 0.0) or 0.0),
+                0.0,
+            )
+            self._savings_tracker_output_tokens_offset = max(
+                int(tracker_lifetime.get("total_output_tokens", 0) or 0),
+                0,
+            )
+            self._savings_tracker_output_cost_usd_offset = max(
+                float(tracker_lifetime.get("total_output_cost_usd", 0.0) or 0.0),
+                0.0,
+            )
 
         self._lock = asyncio.Lock()
         # Tiny synchronous critical section for stage-timing triple updates
@@ -356,21 +379,35 @@ class PrometheusMetrics:
     def _get_otel_metrics(self) -> HeadroomOtelMetrics:
         return self._otel_metrics or get_otel_metrics()
 
-    def _current_savings_tracker_totals(self) -> tuple[int, float]:
+    def _current_savings_tracker_totals(self) -> tuple[int, float, int, float]:
         total_input_tokens = self._savings_tracker_input_tokens_offset + self.tokens_input_total
         total_input_cost_usd = self._savings_tracker_input_cost_usd_offset
+        total_output_tokens = self._savings_tracker_output_tokens_offset + self.tokens_output_total
+        total_output_cost_usd = self._savings_tracker_output_cost_usd_offset
 
         if self.cost_tracker is None:
-            return total_input_tokens, total_input_cost_usd
+            return (
+                total_input_tokens,
+                total_input_cost_usd,
+                total_output_tokens,
+                total_output_cost_usd,
+            )
 
         try:
             cost_stats = self.cost_tracker.stats()
         except Exception:
             logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
-            return total_input_tokens, total_input_cost_usd
+            return (
+                total_input_tokens,
+                total_input_cost_usd,
+                total_output_tokens,
+                total_output_cost_usd,
+            )
 
         tracked_input_tokens = cost_stats.get("total_input_tokens")
         tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
+        tracked_output_tokens = cost_stats.get("total_output_tokens")
+        tracked_output_cost_usd = cost_stats.get("total_output_cost_usd")
 
         if tracked_input_tokens is not None:
             try:
@@ -390,7 +427,30 @@ class PrometheusMetrics:
             except (TypeError, ValueError):
                 pass
 
-        return total_input_tokens, total_input_cost_usd
+        if tracked_output_tokens is not None:
+            try:
+                total_output_tokens = self._savings_tracker_output_tokens_offset + max(
+                    int(tracked_output_tokens),
+                    0,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if tracked_output_cost_usd is not None:
+            try:
+                total_output_cost_usd = self._savings_tracker_output_cost_usd_offset + max(
+                    float(tracked_output_cost_usd),
+                    0.0,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        return (
+            total_input_tokens,
+            total_input_cost_usd,
+            total_output_tokens,
+            total_output_cost_usd,
+        )
 
     def record_stack(self, stack: str | None) -> None:
         """Increment the per-stack request counter.
@@ -661,7 +721,12 @@ class PrometheusMetrics:
             if len(self.savings_history) > 500:
                 self.savings_history = self.savings_history[-500:]
 
-            total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
+            (
+                total_input_tokens,
+                total_input_cost_usd,
+                total_output_tokens,
+                total_output_cost_usd,
+            ) = self._current_savings_tracker_totals()
             self.savings_tracker.record_request(
                 model=model,
                 input_tokens=input_tokens,
@@ -671,8 +736,12 @@ class PrometheusMetrics:
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                output_tokens=output_tokens,
                 total_input_tokens=total_input_tokens,
                 total_input_cost_usd=total_input_cost_usd,
+                total_output_tokens=total_output_tokens,
+                total_output_cost_usd=total_output_cost_usd,
+                authoritative_totals=self._cost_tracker_persistent,
             )
 
             # Also append to the durable, multi-process savings ledger so

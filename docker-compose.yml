@@ -4,9 +4,20 @@ services:
     command: ["--host", "0.0.0.0"]
     environment:
       - HEADROOM_HOST=0.0.0.0
+      # Read-write state dir (cost/token history + savings history). Mounted on
+      # the headroom_data volume below so it survives container re-deploys.
+      - HEADROOM_WORKSPACE_DIR=/data
+      # Flat-rate pricing so the cost figure maps to credit-point endpoints
+      # (e.g. IBM ICA). Input includes uncached + cache tokens. Adjust to taste.
+      - HEADROOM_PRICE_INPUT_PER_1M=5
+      - HEADROOM_PRICE_OUTPUT_PER_1M=25
+      # AST-based code compression (the image ships the tree-sitter `code` extra).
+      - HEADROOM_CODE_AWARE_ENABLED=1
       # if you want to use a custom OpenAI-compatible API endpoint,
       # uncomment and set the following line with the desired URL
       # - OPENAI_TARGET_API_URL=https://api.x.ai
+    volumes:
+      - headroom_data:/data
     ports:
       - "8787:8787"
     volumes:
@@ -51,3 +62,4 @@ volumes:
   headroom_workspace:    # persists proxy_savings, memory.db, session_stats, toin across image updates
   qdrant_data:
   neo4j_data:
+  headroom_data:

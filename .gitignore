@@ -263,3 +263,6 @@ uv.lock
 scripts/ica_tokens.txt
 *ica_tokens.txt
 .headroom/
+
+# Black Duck / Polaris local scanner config
+.codesight/

@@ -272,6 +272,15 @@ class ProxyConfig:
     cost_tracking_enabled: bool = True
     budget_limit_usd: float | None = None
     budget_period: Literal["hourly", "daily", "monthly"] = "daily"
+    # Flat-rate pricing override (USD per 1M tokens). When both are set, the
+    # CostTracker prices every request at these rates instead of looking the
+    # model up in LiteLLM's database. Needed for credit-point endpoints (e.g.
+    # IBM ICA) whose model names aren't in LiteLLM, so costs would otherwise be
+    # dropped. All input-side tokens (uncached + cache-read + cache-write) are
+    # priced at the input rate; output tokens at the output rate. Unset = use
+    # LiteLLM pricing as before.
+    price_input_per_1m: float | None = None
+    price_output_per_1m: float | None = None
 
     # Logging
     log_requests: bool = True

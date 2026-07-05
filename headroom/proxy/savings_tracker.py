@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
 DEFAULT_SAVINGS_DIR = ".headroom"
 DEFAULT_SAVINGS_FILE = "proxy_savings.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
 PROJECT_NAME_MAX_LENGTH = 128
@@ -273,6 +273,29 @@ def _estimate_input_cost_usd(
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
+def _estimate_output_cost_usd(model: str, output_tokens: int) -> float:
+    """Estimate output spend in USD for a request (LiteLLM list price).
+
+    This is only a fallback delta estimate; the authoritative cumulative output
+    cost is supplied by the caller from the CostTracker (which honours the flat
+    pricing override), so credit-point endpoints whose models aren't in LiteLLM
+    still report the configured cost.
+    """
+    total_output_tokens = _coerce_int(output_tokens)
+    litellm = _get_litellm_module()
+    if total_output_tokens <= 0 or litellm is None:
+        return 0.0
+    try:
+        resolved = _resolve_litellm_model(model)
+        info = litellm.model_cost.get(resolved, {})
+        output_cost_per_token = info.get("output_cost_per_token")
+        if not output_cost_per_token:
+            return 0.0
+        return float(total_output_tokens) * float(output_cost_per_token)
+    except Exception:
+        return 0.0
+
+
 def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     """Normalize persisted history entries across schema shapes."""
     timestamp: datetime | None = None
@@ -280,6 +303,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     compression_savings_usd = 0.0
     total_input_tokens = 0
     total_input_cost_usd = 0.0
+    total_output_tokens = 0
+    total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
 
@@ -289,6 +314,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         compression_savings_usd = _coerce_float(entry.get("compression_savings_usd"))
         total_input_tokens = _coerce_int(entry.get("total_input_tokens"))
         total_input_cost_usd = _coerce_float(entry.get("total_input_cost_usd"))
+        total_output_tokens = _coerce_int(entry.get("total_output_tokens"))
+        total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
     elif isinstance(entry, list | tuple) and len(entry) >= 2:
@@ -300,6 +327,10 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
             total_input_tokens = _coerce_int(entry[3])
         if len(entry) >= 5:
             total_input_cost_usd = _coerce_float(entry[4])
+        if len(entry) >= 6:
+            total_output_tokens = _coerce_int(entry[5])
+        if len(entry) >= 7:
+            total_output_cost_usd = _coerce_float(entry[6])
     else:
         return None
 
@@ -314,6 +345,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "compression_savings_usd": round(compression_savings_usd, 6),
         "total_input_tokens": total_input_tokens,
         "total_input_cost_usd": round(total_input_cost_usd, 6),
+        "total_output_tokens": total_output_tokens,
+        "total_output_cost_usd": round(total_output_cost_usd, 6),
     }
 
 
@@ -324,6 +357,8 @@ def _empty_display_session() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
         "savings_percent": 0.0,
         "started_at": None,
         "last_activity_at": None,
@@ -419,6 +454,11 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         "total_input_tokens": total_input_tokens,
         "total_input_cost_usd": round(
             _coerce_float(entry.get("total_input_cost_usd")),
+            6,
+        ),
+        "total_output_tokens": _coerce_int(entry.get("total_output_tokens")),
+        "total_output_cost_usd": round(
+            _coerce_float(entry.get("total_output_cost_usd")),
             6,
         ),
         "savings_percent": savings_percent,
@@ -541,11 +581,23 @@ class SavingsTracker:
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        output_tokens: int = 0,
         total_input_tokens: int | None = None,
         total_input_cost_usd: float | None = None,
+        total_output_tokens: int | None = None,
+        total_output_cost_usd: float | None = None,
+        authoritative_totals: bool = False,
         timestamp: datetime | str | None = None,
     ) -> bool:
-        """Persist a canonical display-session update for every request."""
+        """Persist a canonical display-session update for every request.
+
+        When ``authoritative_totals`` is set, the supplied cumulative totals are
+        treated as the source of truth and assigned directly (rather than taking
+        the running ``max``). This is used when the CostTracker persists across
+        restarts and owns the cumulative history — it lets the savings lifetime
+        self-correct if a prior bug inflated it, instead of latching the high
+        value forever.
+        """
         timestamp_dt = (
             _parse_timestamp(timestamp)
             if isinstance(timestamp, str)
@@ -566,35 +618,77 @@ class SavingsTracker:
             cache_write_tokens=cache_write_tokens,
             uncached_input_tokens=uncached_input_tokens,
         )
+        delta_output_tokens = _coerce_int(output_tokens)
+        delta_output_cost_usd = _estimate_output_cost_usd(model, delta_output_tokens)
 
         with self._lock:
             lifetime = self._state["lifetime"]
             previous_total_input_tokens = lifetime["total_input_tokens"]
             previous_total_input_cost_usd = lifetime["total_input_cost_usd"]
+            previous_total_output_tokens = lifetime.get("total_output_tokens", 0)
+            previous_total_output_cost_usd = lifetime.get("total_output_cost_usd", 0.0)
 
-            next_total_input_tokens = max(
-                previous_total_input_tokens + delta_input_tokens,
-                _coerce_int(
-                    total_input_tokens,
-                    default=previous_total_input_tokens + delta_input_tokens,
-                ),
-            )
-            next_total_input_cost_usd = round(
-                max(
-                    previous_total_input_cost_usd + delta_input_cost_usd,
-                    _coerce_float(
-                        total_input_cost_usd,
-                        default=previous_total_input_cost_usd + delta_input_cost_usd,
+            if authoritative_totals and total_input_tokens is not None:
+                next_total_input_tokens = _coerce_int(total_input_tokens)
+            else:
+                next_total_input_tokens = max(
+                    previous_total_input_tokens + delta_input_tokens,
+                    _coerce_int(
+                        total_input_tokens,
+                        default=previous_total_input_tokens + delta_input_tokens,
                     ),
-                ),
-                6,
-            )
+                )
+            if authoritative_totals and total_input_cost_usd is not None:
+                next_total_input_cost_usd = round(_coerce_float(total_input_cost_usd), 6)
+            else:
+                next_total_input_cost_usd = round(
+                    max(
+                        previous_total_input_cost_usd + delta_input_cost_usd,
+                        _coerce_float(
+                            total_input_cost_usd,
+                            default=previous_total_input_cost_usd + delta_input_cost_usd,
+                        ),
+                    ),
+                    6,
+                )
             session_input_tokens_delta = max(
                 next_total_input_tokens - previous_total_input_tokens,
                 0,
             )
             session_input_cost_delta = round(
                 max(next_total_input_cost_usd - previous_total_input_cost_usd, 0.0),
+                6,
+            )
+
+            if authoritative_totals and total_output_tokens is not None:
+                next_total_output_tokens = _coerce_int(total_output_tokens)
+            else:
+                next_total_output_tokens = max(
+                    previous_total_output_tokens + delta_output_tokens,
+                    _coerce_int(
+                        total_output_tokens,
+                        default=previous_total_output_tokens + delta_output_tokens,
+                    ),
+                )
+            if authoritative_totals and total_output_cost_usd is not None:
+                next_total_output_cost_usd = round(_coerce_float(total_output_cost_usd), 6)
+            else:
+                next_total_output_cost_usd = round(
+                    max(
+                        previous_total_output_cost_usd + delta_output_cost_usd,
+                        _coerce_float(
+                            total_output_cost_usd,
+                            default=previous_total_output_cost_usd + delta_output_cost_usd,
+                        ),
+                    ),
+                    6,
+                )
+            session_output_tokens_delta = max(
+                next_total_output_tokens - previous_total_output_tokens,
+                0,
+            )
+            session_output_cost_delta = round(
+                max(next_total_output_cost_usd - previous_total_output_cost_usd, 0.0),
                 6,
             )
 
@@ -606,6 +700,8 @@ class SavingsTracker:
             )
             lifetime["total_input_tokens"] = next_total_input_tokens
             lifetime["total_input_cost_usd"] = next_total_input_cost_usd
+            lifetime["total_output_tokens"] = next_total_output_tokens
+            lifetime["total_output_cost_usd"] = next_total_output_cost_usd
 
             session = self._state["display_session"]
             last_activity = _parse_timestamp(session.get("last_activity_at"))
@@ -626,6 +722,13 @@ class SavingsTracker:
             session["total_input_tokens"] += session_input_tokens_delta
             session["total_input_cost_usd"] = round(
                 session["total_input_cost_usd"] + session_input_cost_delta,
+                6,
+            )
+            session["total_output_tokens"] = (
+                session.get("total_output_tokens", 0) + session_output_tokens_delta
+            )
+            session["total_output_cost_usd"] = round(
+                session.get("total_output_cost_usd", 0.0) + session_output_cost_delta,
                 6,
             )
             total_before = session["tokens_saved"] + session["total_input_tokens"]
@@ -657,6 +760,8 @@ class SavingsTracker:
                         "compression_savings_usd": lifetime["compression_savings_usd"],
                         "total_input_tokens": lifetime["total_input_tokens"],
                         "total_input_cost_usd": lifetime["total_input_cost_usd"],
+                        "total_output_tokens": lifetime["total_output_tokens"],
+                        "total_output_cost_usd": lifetime["total_output_cost_usd"],
                     }
                 )
                 self._trim_history_locked(reference_time=timestamp_dt)
@@ -793,6 +898,8 @@ class SavingsTracker:
                 "compression_savings_usd",
                 "total_input_tokens",
                 "total_input_cost_usd",
+                "total_output_tokens",
+                "total_output_cost_usd",
             ]
         else:
             fieldnames = [
@@ -805,6 +912,10 @@ class SavingsTracker:
                 "total_input_tokens",
                 "total_input_cost_usd_delta",
                 "total_input_cost_usd",
+                "total_output_tokens_delta",
+                "total_output_tokens",
+                "total_output_cost_usd_delta",
+                "total_output_cost_usd",
             ]
 
         buffer = StringIO()
@@ -843,6 +954,8 @@ class SavingsTracker:
                 "compression_savings_usd": 0.0,
                 "total_input_tokens": 0,
                 "total_input_cost_usd": 0.0,
+                "total_output_tokens": 0,
+                "total_output_cost_usd": 0.0,
             },
             "display_session": _empty_display_session(),
             "history": [],
@@ -882,12 +995,16 @@ class SavingsTracker:
         lifetime_savings_usd = 0.0
         lifetime_input_tokens = 0
         lifetime_input_cost_usd = 0.0
+        lifetime_output_tokens = 0
+        lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
             lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
             lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
+            lifetime_output_tokens = _coerce_int(lifetime_raw.get("total_output_tokens"))
+            lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
         if normalized_history:
             last = normalized_history[-1]
@@ -907,6 +1024,14 @@ class SavingsTracker:
                 lifetime_input_cost_usd,
                 _coerce_float(last.get("total_input_cost_usd")),
             )
+            lifetime_output_tokens = max(
+                lifetime_output_tokens,
+                _coerce_int(last.get("total_output_tokens")),
+            )
+            lifetime_output_cost_usd = max(
+                lifetime_output_cost_usd,
+                _coerce_float(last.get("total_output_cost_usd")),
+            )
 
         state = {
             "schema_version": SCHEMA_VERSION,
@@ -916,6 +1041,8 @@ class SavingsTracker:
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
+                "total_output_tokens": lifetime_output_tokens,
+                "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
@@ -1092,6 +1219,8 @@ class SavingsTracker:
         prev_total_usd = 0.0
         prev_total_input_tokens = 0
         prev_total_input_cost_usd = 0.0
+        prev_total_output_tokens = 0
+        prev_total_output_cost_usd = 0.0
 
         for point in history:
             timestamp = _parse_timestamp(point["timestamp"])
@@ -1105,6 +1234,8 @@ class SavingsTracker:
             total_usd = _coerce_float(point.get("compression_savings_usd"))
             total_input_tokens = _coerce_int(point.get("total_input_tokens"))
             total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
+            total_output_tokens = _coerce_int(point.get("total_output_tokens"))
+            total_output_cost_usd = _coerce_float(point.get("total_output_cost_usd"))
             delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
             delta_usd = max(total_usd - prev_total_usd, 0.0)
             delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
@@ -1112,11 +1243,18 @@ class SavingsTracker:
                 total_input_cost_usd - prev_total_input_cost_usd,
                 0.0,
             )
+            delta_output_tokens = max(total_output_tokens - prev_total_output_tokens, 0)
+            delta_output_cost_usd = max(
+                total_output_cost_usd - prev_total_output_cost_usd,
+                0.0,
+            )
 
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
             prev_total_input_tokens = total_input_tokens
             prev_total_input_cost_usd = total_input_cost_usd
+            prev_total_output_tokens = total_output_tokens
+            prev_total_output_cost_usd = total_output_cost_usd
 
             entry = aggregated.setdefault(
                 bucket_key,
@@ -1130,6 +1268,10 @@ class SavingsTracker:
                     "total_input_tokens": total_input_tokens,
                     "total_input_cost_usd_delta": 0.0,
                     "total_input_cost_usd": total_input_cost_usd,
+                    "total_output_tokens_delta": 0,
+                    "total_output_tokens": total_output_tokens,
+                    "total_output_cost_usd_delta": 0.0,
+                    "total_output_cost_usd": total_output_cost_usd,
                     "by_provider": {},
                     "by_model": {},
                 },
@@ -1144,16 +1286,30 @@ class SavingsTracker:
                 entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
                 6,
             )
+            entry["total_output_tokens_delta"] += delta_output_tokens
+            entry["total_output_cost_usd_delta"] = round(
+                entry["total_output_cost_usd_delta"] + delta_output_cost_usd,
+                6,
+            )
             entry["total_tokens_saved"] = total_tokens_saved
             entry["compression_savings_usd"] = round(total_usd, 6)
             entry["total_input_tokens"] = total_input_tokens
             entry["total_input_cost_usd"] = round(total_input_cost_usd, 6)
+            entry["total_output_tokens"] = total_output_tokens
+            entry["total_output_cost_usd"] = round(total_output_cost_usd, 6)
 
             # Attribute this checkpoint's delta to the provider that produced
             # it. Each checkpoint comes from a single request, so its delta is
             # wholly owned by one provider. Skip no-op checkpoints so providers
             # only appear in a bucket where they actually moved a counter.
-            if delta_tokens or delta_usd or delta_input_tokens or delta_input_cost_usd:
+            if (
+                delta_tokens
+                or delta_usd
+                or delta_input_tokens
+                or delta_input_cost_usd
+                or delta_output_tokens
+                or delta_output_cost_usd
+            ):
                 provider = _normalize_provider(point.get("provider"))
                 prov = entry["by_provider"].setdefault(
                     provider,
@@ -1162,6 +1318,8 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        "total_output_tokens_delta": 0,
+                        "total_output_cost_usd_delta": 0.0,
                     },
                 )
                 prov["tokens_saved"] += delta_tokens
@@ -1174,6 +1332,11 @@ class SavingsTracker:
                     prov["total_input_cost_usd_delta"] + delta_input_cost_usd,
                     6,
                 )
+                prov["total_output_tokens_delta"] += delta_output_tokens
+                prov["total_output_cost_usd_delta"] = round(
+                    prov["total_output_cost_usd_delta"] + delta_output_cost_usd,
+                    6,
+                )
 
                 model = _normalize_model(point.get("model"))
                 mod = entry["by_model"].setdefault(
@@ -1183,6 +1346,8 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        "total_output_tokens_delta": 0,
+                        "total_output_cost_usd_delta": 0.0,
                     },
                 )
                 mod["tokens_saved"] += delta_tokens
@@ -1193,6 +1358,11 @@ class SavingsTracker:
                 mod["total_input_tokens_delta"] += delta_input_tokens
                 mod["total_input_cost_usd_delta"] = round(
                     mod["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                    6,
+                )
+                mod["total_output_tokens_delta"] += delta_output_tokens
+                mod["total_output_cost_usd_delta"] = round(
+                    mod["total_output_cost_usd_delta"] + delta_output_cost_usd,
                     6,
                 )
 

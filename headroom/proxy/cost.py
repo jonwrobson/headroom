@@ -9,9 +9,13 @@ Extracted from server.py for maintainability.
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
+import os
+import tempfile
 from collections import deque
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.modes import PROXY_MODE_CACHE
@@ -617,9 +621,27 @@ class CostTracker:
     # get_period_cost() undercounts and check_budget() silently under-enforces.
     COST_RETENTION_HOURS = 744  # 31 days
 
-    def __init__(self, budget_limit_usd: float | None = None, budget_period: str = "daily"):
+    def __init__(
+        self,
+        budget_limit_usd: float | None = None,
+        budget_period: str = "daily",
+        price_input_per_1m: float | None = None,
+        price_output_per_1m: float | None = None,
+    ):
         self.budget_limit_usd = budget_limit_usd
         self.budget_period = budget_period
+
+        # Flat-rate pricing override (USD per 1M tokens). When both are set, the
+        # tracker prices every request at these rates instead of LiteLLM lookup,
+        # so credit-point endpoints (e.g. IBM ICA) whose model names aren't in
+        # LiteLLM still get a cost. All input-side tokens (uncached + cache) use
+        # the input rate; output tokens use the output rate.
+        self._price_input_per_token: float | None = (
+            price_input_per_1m / 1_000_000 if price_input_per_1m is not None else None
+        )
+        self._price_output_per_token: float | None = (
+            price_output_per_1m / 1_000_000 if price_output_per_1m is not None else None
+        )
 
         # Cost tracking - using deque for efficient left-side removal
         self._costs: deque[tuple[datetime, float]] = deque(maxlen=self.MAX_COST_ENTRIES)
@@ -629,6 +651,7 @@ class CostTracker:
         self._tokens_saved_by_model: dict[str, int] = {}
         self._tokens_sent_by_model: dict[str, int] = {}
         self._requests_by_model: dict[str, int] = {}
+        self._output_tokens_by_model: dict[str, int] = {}
 
         # API-reported cache breakdown per model (for accurate cost calculation)
         self._api_cache_read_by_model: dict[str, int] = {}
@@ -644,6 +667,7 @@ class CostTracker:
         self._tokens_saved_by_model.clear()
         self._tokens_sent_by_model.clear()
         self._requests_by_model.clear()
+        self._output_tokens_by_model.clear()
         self._api_cache_read_by_model.clear()
         self._api_cache_write_by_model.clear()
         self._api_cache_write_5m_by_model.clear()
@@ -670,6 +694,15 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
+        # Flat-rate override: price everything at the configured rates and skip
+        # LiteLLM entirely. All input-side tokens (uncached + cache read/write)
+        # use the input rate; output tokens use the output rate.
+        if self._price_input_per_token is not None and self._price_output_per_token is not None:
+            total_cost = (
+                input_tokens + cache_read_tokens + cache_write_tokens
+            ) * self._price_input_per_token + output_tokens * self._price_output_per_token
+            return float(total_cost) if total_cost > 0 else None
+
         litellm = _get_litellm_module()
         if litellm is None:
             logger.warning("LiteLLM not available - cannot calculate costs")
@@ -759,6 +792,9 @@ class CostTracker:
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens
         )
+        self._output_tokens_by_model[model] = (
+            self._output_tokens_by_model.get(model, 0) + output_tokens
+        )
 
         # Populate _costs so check_budget() has real data to enforce against.
         # When the call site had no API usage breakdown (all cache/uncached
@@ -802,6 +838,8 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
+        if self._price_input_per_token is not None:
+            return self._price_input_per_token * 1_000_000
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -821,6 +859,13 @@ class CostTracker:
         Returns (cache_read, cache_write, uncached) per-token costs, or None
         if pricing is unavailable. Uses LiteLLM's native cache pricing data.
         """
+        # Flat-rate override: all input-side tokens priced at the input rate.
+        if self._price_input_per_token is not None:
+            return (
+                self._price_input_per_token,
+                self._price_input_per_token,
+                self._price_input_per_token,
+            )
         litellm = _get_litellm_module()
         if litellm is None:
             return None
@@ -838,6 +883,22 @@ class CostTracker:
         except Exception:
             return None
 
+    def _get_output_price(self, model: str) -> float | None:
+        """Get per-token output price for a model (flat override or LiteLLM)."""
+        if self._price_output_per_token is not None:
+            return self._price_output_per_token
+        litellm = _get_litellm_module()
+        if litellm is None:
+            return None
+        try:
+            from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+            resolved = resolve_litellm_model(model)
+            info = litellm.model_cost.get(resolved, {})
+            return info.get("output_cost_per_token") or None
+        except Exception:
+            return None
+
     def stats(self) -> dict:
         """Get token statistics per model."""
         per_model = {}
@@ -851,6 +912,7 @@ class CostTracker:
                 "requests": reqs,
                 "tokens_saved": saved,
                 "tokens_sent": sent,
+                "output_tokens": self._output_tokens_by_model.get(model, 0),
                 "cache_write_5m_tokens": self._api_cache_write_5m_by_model.get(model, 0),
                 "cache_write_1h_tokens": self._api_cache_write_1h_by_model.get(model, 0),
                 "reduction_pct": round(saved / (saved + sent) * 100, 1)
@@ -900,17 +962,132 @@ class CostTracker:
                 _cr_price, _cw_price, uncached_price = prices
                 savings_usd += saved * uncached_price
 
+        # Output cost: output tokens priced at the model's output rate (flat
+        # override or LiteLLM). Kept separate from input so dashboards can show
+        # the breakdown; `cost_with_headroom_usd` below is the input+output total.
+        input_cost = cost_with_headroom
+        output_cost = 0.0
+        total_output_tokens = 0
+        for model, out_tokens in self._output_tokens_by_model.items():
+            total_output_tokens += out_tokens
+            if out_tokens <= 0:
+                continue
+            out_price = self._get_output_price(model)
+            if out_price:
+                output_cost += out_tokens * out_price
+
         return {
             "total_tokens_saved": total_saved,
             "total_input_tokens": total_input_tokens,
-            "total_input_cost_usd": round(cost_with_headroom, 4),
+            "total_output_tokens": total_output_tokens,
+            "total_input_cost_usd": round(input_cost, 4),
+            "total_output_cost_usd": round(output_cost, 4),
+            "total_cost_usd": round(input_cost + output_cost, 4),
             "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),
             "cache_write_1h_tokens": sum(self._api_cache_write_1h_by_model.values()),
             "per_model": per_model,
-            "cost_with_headroom_usd": round(cost_with_headroom, 4),
+            # Total billed cost (input + output). Named `cost_with_headroom_usd`
+            # for back-compat with the dashboard/session summary, which read this
+            # key as "what you actually paid with Headroom in front".
+            "cost_with_headroom_usd": round(input_cost + output_cost, 4),
             "savings_usd": round(savings_usd, 4),
             # Budget config passthrough — surfaces in /stats["cost"] so
             # `headroom doctor` can report whether a budget is set.
             "budget_limit_usd": self.budget_limit_usd,
             "budget_period": self.budget_period,
         }
+
+    # ------------------------------------------------------------------
+    # Persistence
+    #
+    # CostTracker is per-process and otherwise in-memory, so a container
+    # restart/re-deploy loses all cost and token history. These methods
+    # snapshot the accumulators (and the budget-enforcement deque) to a JSON
+    # file on disk — mount that path on a Docker volume to survive re-deploys.
+    # Atomic tempfile -> fsync -> replace, mirroring SavingsTracker._save_locked.
+    # ------------------------------------------------------------------
+    STATE_SCHEMA_VERSION = 1
+
+    # Attribute name -> JSON key for the per-model integer accumulators.
+    _PERSISTED_MAPS = (
+        "_tokens_saved_by_model",
+        "_tokens_sent_by_model",
+        "_requests_by_model",
+        "_output_tokens_by_model",
+        "_api_cache_read_by_model",
+        "_api_cache_write_by_model",
+        "_api_cache_write_5m_by_model",
+        "_api_cache_write_1h_by_model",
+        "_api_uncached_by_model",
+    )
+
+    def _state_path(self, path: str | os.PathLike[str] | None = None) -> Path:
+        from headroom import paths as _paths
+
+        return _paths.cost_state_path(path)
+
+    def save(self, path: str | os.PathLike[str] | None = None) -> None:
+        """Atomically persist tracker state to ``path`` (default workspace JSON)."""
+        target = self._state_path(path)
+        try:
+            payload = {
+                "schema_version": self.STATE_SCHEMA_VERSION,
+                "maps": {name: getattr(self, name) for name in self._PERSISTED_MAPS},
+                # Budget-enforcement window: (iso timestamp, cost) pairs.
+                "costs": [[ts.isoformat(), cost] for ts, cost in self._costs],
+            }
+            data = json.dumps(payload)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=target.parent, prefix=".proxy_cost_", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                Path(tmp_path).replace(target)
+            except Exception:
+                try:
+                    Path(tmp_path).unlink()
+                except OSError:
+                    pass
+                raise
+        except OSError as e:
+            logger.warning("Failed to save cost state to %s: %s", target, e)
+
+    def load(self, path: str | os.PathLike[str] | None = None) -> bool:
+        """Restore tracker state from ``path``. Returns True if state was loaded.
+
+        Missing or corrupt files are tolerated (logged, tracker stays empty) so
+        a bad checkpoint never blocks proxy startup.
+        """
+        target = self._state_path(path)
+        if not target.exists():
+            return False
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning("Failed to load cost state from %s: %s", target, e)
+            return False
+
+        maps = payload.get("maps", {}) if isinstance(payload, dict) else {}
+        for name in self._PERSISTED_MAPS:
+            stored = maps.get(name)
+            if isinstance(stored, dict):
+                restored = getattr(self, name)
+                restored.clear()
+                for model, count in stored.items():
+                    if isinstance(model, str) and isinstance(count, int):
+                        restored[model] = count
+
+        self._costs.clear()
+        for entry in payload.get("costs", []) if isinstance(payload, dict) else []:
+            try:
+                ts_raw, cost = entry
+                self._costs.append((datetime.fromisoformat(ts_raw), float(cost)))
+            except (ValueError, TypeError):
+                continue
+
+        logger.info("Loaded cost state from %s", target)
+        return True

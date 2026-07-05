@@ -120,7 +120,7 @@ class TestLoadTokensFromFile:
             "sk-one\n"  # duplicate dropped
             "sk-three\n"
         )
-        assert load_tokens_from_file(f) == ["sk-one", "sk-two", "sk-three"]
+        assert [t.token for t in load_tokens_from_file(f)] == ["sk-one", "sk-two", "sk-three"]
 
     def test_from_file_classmethod(self, tmp_path):
         f = tmp_path / "tokens.txt"

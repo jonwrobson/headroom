@@ -494,6 +494,29 @@ def dashboard(port: int, no_open: bool) -> None:
         "Env: HEADROOM_BUDGET_PERIOD."
     ),
 )
+@click.option(
+    "--price-input",
+    type=click.FloatRange(min=0.0),
+    default=None,
+    envvar="HEADROOM_PRICE_INPUT_PER_1M",
+    help=(
+        "Flat input price in USD per 1M tokens, overriding LiteLLM's pricing "
+        "database. Use with --price-output for credit-point endpoints (e.g. IBM "
+        "ICA) whose model names aren't in LiteLLM. All input-side tokens "
+        "(uncached + cache) are priced at this rate. Env: HEADROOM_PRICE_INPUT_PER_1M."
+    ),
+)
+@click.option(
+    "--price-output",
+    type=click.FloatRange(min=0.0),
+    default=None,
+    envvar="HEADROOM_PRICE_OUTPUT_PER_1M",
+    help=(
+        "Flat output price in USD per 1M tokens, overriding LiteLLM's pricing "
+        "database. Requires --price-input to take effect. "
+        "Env: HEADROOM_PRICE_OUTPUT_PER_1M."
+    ),
+)
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
 # We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
@@ -892,6 +915,8 @@ def proxy(
     codex_wire_debug_dir: str | None,
     budget: float | None,
     budget_period: str,
+    price_input: float | None,
+    price_output: float | None,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1161,6 +1186,8 @@ def proxy(
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
+        price_input_per_1m=price_input,
+        price_output_per_1m=price_output,
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).

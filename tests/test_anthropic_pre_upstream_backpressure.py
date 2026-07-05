@@ -260,6 +260,13 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.upstream_exit_times.append(time.perf_counter())
         return _ResponseStub()
 
+    async def _retry_request_with_token_rotation(self, *args, **kwargs):
+        # The auth-token-pool wrapper the real handler now calls at the
+        # upstream_connect stage. With no pool configured it is a transparent
+        # passthrough to ``_retry_request`` (see server.py), so the dummy mirrors
+        # that: delegate to the stub above and keep measuring semaphore timing.
+        return await self._retry_request(*args, **kwargs)
+
     def _get_compression_cache(self, session_id):
         return SimpleNamespace(
             apply_cached=lambda m: m,

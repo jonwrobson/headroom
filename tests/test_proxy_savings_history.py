@@ -72,6 +72,8 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "compression_savings_usd": 0.5,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -113,13 +115,15 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     )
     snapshot = tracker.snapshot()
 
-    assert snapshot["schema_version"] == 3
+    assert snapshot["schema_version"] == 4
     assert snapshot["lifetime"] == {
         "requests": 0,
         "tokens_saved": 30,
         "compression_savings_usd": pytest.approx(0.03),
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == [
@@ -131,6 +135,8 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "compression_savings_usd": 0.03,
             "total_input_tokens": 0,
             "total_input_cost_usd": 0.0,
+            "total_output_tokens": 0,
+            "total_output_cost_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -153,6 +159,8 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "compression_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == []
@@ -556,6 +564,8 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
         "compression_savings_usd": pytest.approx(0.02),
         "total_input_tokens": 200,
         "total_input_cost_usd": pytest.approx(0.2),
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
         "savings_percent": pytest.approx(9.09),
         "started_at": "2026-03-27T09:00:00Z",
         "last_activity_at": "2026-03-27T09:10:00Z",
@@ -588,6 +598,8 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
         "compression_savings_usd": pytest.approx(0.005),
         "total_input_tokens": 50,
         "total_input_cost_usd": pytest.approx(0.05),
+        "total_output_tokens": 0,
+        "total_output_cost_usd": 0.0,
         "savings_percent": pytest.approx(9.09),
         "started_at": "2026-03-27T10:05:00Z",
         "last_activity_at": "2026-03-27T10:05:00Z",
@@ -1016,7 +1028,7 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         history = client.get("/stats-history")
         assert history.status_code == 200
         history_data = history.json()
-        assert history_data["schema_version"] == 3
+        assert history_data["schema_version"] == 4
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
         assert history_data["lifetime"]["total_input_tokens"] == 120
@@ -1122,7 +1134,9 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
         assert lines[0] == (
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
             "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
-            "total_input_cost_usd_delta,total_input_cost_usd"
+            "total_input_cost_usd_delta,total_input_cost_usd,"
+            "total_output_tokens_delta,total_output_tokens,"
+            "total_output_cost_usd_delta,total_output_cost_usd"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
@@ -1221,6 +1235,122 @@ def test_stats_history_includes_cli_filtering(tmp_path, monkeypatch):
     assert data["cli_filtering"]["tool"] == "rtk"
     assert data["cli_filtering"]["label"] == "RTK"
     assert data["cli_filtering"]["lifetime"]["tokens_saved"] == 999
+
+
+def test_record_request_tracks_output_tokens_and_cost(tmp_path, monkeypatch):
+    """Output tokens/cost flow into lifetime, session, history, and rollups."""
+    monkeypatch.setenv(HEADROOM_SAVINGS_PATH_ENV_VAR, str(tmp_path / "proxy_savings.json"))
+    tracker = SavingsTracker()
+
+    ts = datetime(2026, 6, 18, 9, 0, 0, tzinfo=timezone.utc)
+    # Caller supplies authoritative cumulative output totals (as PrometheusMetrics
+    # does from the CostTracker), so flat-priced credit-point endpoints report cost
+    # even though the model is unknown to LiteLLM.
+    tracker.record_request(
+        model="ica/credit-model",
+        input_tokens=1000,
+        tokens_saved=200,
+        output_tokens=500,
+        total_input_tokens=1000,
+        total_input_cost_usd=0.005,
+        total_output_tokens=500,
+        total_output_cost_usd=0.0125,
+        timestamp=ts,
+    )
+
+    resp = tracker.history_response()
+    # Lifetime + history are the persistent totals the dashboard reads. (The
+    # display_session view is intentionally not asserted here — it expires after
+    # an inactivity window relative to wall-clock, so a past timestamp rolls off.)
+    assert resp["lifetime"]["total_output_tokens"] == 500
+    assert resp["lifetime"]["total_output_cost_usd"] == pytest.approx(0.0125)
+    assert resp["history"][-1]["total_output_tokens"] == 500
+    assert resp["history"][-1]["total_output_cost_usd"] == pytest.approx(0.0125)
+
+    # Output columns are present in the CSV export.
+    header = tracker.export_csv(series="history").splitlines()[0]
+    assert "total_output_tokens" in header
+    assert "total_output_cost_usd" in header
+
+
+def test_persistent_cost_tracker_does_not_double_count_or_compound(tmp_path, monkeypatch):
+    """Regression: with a persisted cost tracker, /stats-history input must equal
+    the cost tracker's cumulative total (no savings-offset double-count), and a
+    previously-inflated lifetime must self-heal rather than latch high."""
+    from headroom.proxy.cost import CostTracker
+    from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+    monkeypatch.setenv(HEADROOM_SAVINGS_PATH_ENV_VAR, str(tmp_path / "proxy_savings.json"))
+
+    # Savings lifetime arrives inflated from a prior buggy run...
+    savings = SavingsTracker()
+    savings.record_request(
+        model="ica/m",
+        input_tokens=1,
+        tokens_saved=0,
+        total_input_tokens=99999,
+        total_input_cost_usd=9.9999,
+    )
+    # ...while the (persisted) cost tracker holds the correct cumulative total
+    # (4000 prior + this request's 1000 in / 500 out = 5000 / 2500).
+    cost = CostTracker(price_input_per_1m=5, price_output_per_1m=25)
+    cost.record_tokens("ica/m", 0, 4000, uncached_tokens=4000, output_tokens=2000)
+
+    metrics = PrometheusMetrics(
+        savings_tracker=savings,
+        cost_tracker=cost,
+        cost_tracker_persistent=True,
+    )
+    # Offset must be zeroed so it doesn't add to the (already cumulative) cost total.
+    assert metrics._savings_tracker_input_tokens_offset == 0
+    assert metrics._savings_tracker_output_tokens_offset == 0
+
+    cost.record_tokens("ica/m", 0, 1000, uncached_tokens=1000, output_tokens=500)
+    asyncio.run(
+        metrics.record_request(
+            provider="anthropic",
+            model="ica/m",
+            input_tokens=1000,
+            output_tokens=500,
+            tokens_saved=0,
+            latency_ms=5.0,
+        )
+    )
+    lifetime = savings.history_response()["lifetime"]
+    # Healed to the cost tracker's truth (5000 in / 2500 out), not the inflated 99999.
+    assert lifetime["total_input_tokens"] == 5000
+    assert lifetime["total_output_tokens"] == 2500
+
+
+def test_stats_history_endpoint_exposes_output_cost(tmp_path, monkeypatch):
+    """End-to-end: flat pricing + a request surfaces output cost at /stats-history."""
+    monkeypatch.setenv(HEADROOM_SAVINGS_PATH_ENV_VAR, str(tmp_path / "proxy_savings.json"))
+    config = ProxyConfig(
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+        price_input_per_1m=5,
+        price_output_per_1m=25,
+    )
+    with TestClient(create_app(config)) as client:
+        proxy = client.app.state.proxy
+        proxy.cost_tracker.record_tokens(
+            "ica/credit-model", 0, 1000, uncached_tokens=1000, output_tokens=1000
+        )
+        asyncio.run(
+            proxy.metrics.record_request(
+                provider="anthropic",
+                model="ica/credit-model",
+                input_tokens=1000,
+                output_tokens=1000,
+                tokens_saved=100,
+                latency_ms=10.0,
+            )
+        )
+        lifetime = client.get("/stats-history").json()["lifetime"]
+        # 1M-priced flat rates: 1000 output tokens @ $25/1M = $0.025.
+        assert lifetime["total_output_tokens"] == 1000
+        assert lifetime["total_output_cost_usd"] == pytest.approx(0.025)
 
 
 def test_coercion_helpers_reject_non_finite_values():

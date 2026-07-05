@@ -682,11 +682,22 @@ class HeadroomProxy(
             CostTracker(
                 budget_limit_usd=config.budget_limit_usd,
                 budget_period=config.budget_period,
+                price_input_per_1m=config.price_input_per_1m,
+                price_output_per_1m=config.price_output_per_1m,
             )
             if config.cost_tracking_enabled
             else None
         )
-        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker, stateless=config.stateless)
+        self.metrics = PrometheusMetrics(
+            cost_tracker=self.cost_tracker,
+            stateless=config.stateless,
+            # When the cost tracker persists across restarts it reloads the full
+            # cumulative token/cost history, so it — not the savings tracker's
+            # persisted lifetime — is the source of truth. Tell the metrics layer
+            # to drop its savings-lifetime offset, otherwise the two overlap and
+            # /stats-history double-counts (and compounds every restart).
+            cost_tracker_persistent=_cost_persistence_enabled(),
+        )
 
         # Initialize transforms based on routing mode.
         #
@@ -1585,6 +1596,12 @@ class HeadroomProxy(
             logger.info("CCR: DISABLED")
         logger.info(f"Savings history: {self.metrics.savings_tracker.storage_path}")
 
+        # Restore persisted cost/token totals so they survive a restart or
+        # Docker re-deploy (mount the state path on a volume to keep history).
+        if self.cost_tracker is not None and _cost_persistence_enabled():
+            with contextlib.suppress(Exception):
+                self.cost_tracker.load()
+
         # Reset and rebuild the quota tracker registry for this server instance.
         # reset_quota_registry() ensures a clean slate when the proxy is restarted
         # (e.g. in tests that spin up multiple app instances in the same process).
@@ -1645,6 +1662,11 @@ class HeadroomProxy(
 
     async def shutdown(self):
         """Cleanup async resources."""
+        # Flush cost/token totals to disk so they survive the restart.
+        if self.cost_tracker is not None and _cost_persistence_enabled():
+            with contextlib.suppress(Exception):
+                self.cost_tracker.save()
+
         if self.http_client_h1 and self.http_client_h1 is not self.http_client:
             await self.http_client_h1.aclose()
         self.http_client_h1 = None
@@ -1907,6 +1929,64 @@ class HeadroomProxy(
             match=self.config.spend_limit_match,
         )
 
+    def _response_should_rotate_token(self, response: httpx.Response) -> bool:
+        """Whether an upstream response signals we should try the next token.
+        
+        This includes:
+        - Budget/spend limit errors (budget_exceeded)
+        - Authentication errors (401, invalid_api_key)
+        - Permission errors (permission_error, model access denied)
+        - Other token-specific errors that won't be fixed by retrying
+        """
+        # Rotation is reserved for genuine budget/spend exhaustion. Request-level
+        # errors (model access, permission, auth, malformed body) are identical
+        # across every pooled token, so rotating on them poisons the whole pool
+        # and produces a misleading "all tokens exhausted" error. This helper is
+        # no longer called by the rotation loop (which keys directly off
+        # _response_is_spend_limited); it is kept spend-only for safety.
+        return self._response_is_spend_limited(response)
+        
+        # Check for authentication/permission errors
+        if response.status_code == 401:
+            return True
+        
+        try:
+            body = response.json()
+            if not isinstance(body, dict):
+                return False
+            
+            error = body.get("error", {})
+            if not isinstance(error, dict):
+                return False
+            
+            error_type = error.get("type", "")
+            
+            # Token-specific errors that should trigger rotation
+            token_error_types = {
+                "authentication_error",
+                "invalid_api_key",
+                "permission_error",
+                "invalid_request_error",  # May include model access issues
+            }
+            
+            if error_type in token_error_types:
+                return True
+            
+            # Check message for permission-related issues
+            message = error.get("message", "").lower()
+            if any(phrase in message for phrase in [
+                "permission",
+                "not have access",
+                "does not have permission",
+                "api key does not have",
+            ]):
+                return True
+                
+        except Exception:
+            pass
+        
+        return False
+
     def _all_tokens_exhausted_response(
         self, last_response: httpx.Response | None
     ) -> httpx.Response:
@@ -1936,35 +2016,59 @@ class HeadroomProxy(
         body: dict,
         **kwargs: Any,
     ) -> httpx.Response:
-        """``_retry_request`` wrapper that rotates auth tokens on spend limits.
+        """``_retry_request`` wrapper that rotates auth tokens on errors.
 
         When no token pool is configured this is a transparent passthrough to
         ``_retry_request`` (today's behavior). Otherwise it overrides the
-        Authorization header with the current pooled token and, on a spend-limit
-        error, marks that token exhausted and retries with the next one. Only
-        when every token is exhausted does it return a synthetic ``429`` so the
-        client learns we ran out — every other response (success or genuine
-        error) is returned unchanged.
+        Authorization header with the current pooled token and, on token-specific
+        errors (budget exceeded, authentication, permission), marks that token
+        exhausted and retries with the next one. Only when every token is
+        exhausted does it return a synthetic ``429`` so the client learns we
+        ran out — every other response (success or genuine error) is returned
+        unchanged.
         """
         pool = getattr(self, "auth_token_pool", None)
         if pool is None or len(pool) == 0:
             return await self._retry_request(method, url, headers, body, **kwargs)
 
-        last_spend_response: httpx.Response | None = None
+        last_error_response: httpx.Response | None = None
+        tried_tokens: set[str] = set()
+        
         # Bounded by the token count: each iteration consumes one fresh token.
         for _ in range(len(pool)):
             token = pool.current()
             if token is None:
                 break
+            
+            # Safety check: prevent infinite loop if pool.current() returns same token
+            if token in tried_tokens:
+                logger.error(
+                    "Token rotation loop detected: token ...%s returned again. Breaking loop.",
+                    token[-4:] if len(token) >= 4 else token,
+                )
+                break
+            tried_tokens.add(token)
+            
             attempt_headers = self._apply_pool_token(headers, token)
             response = await self._retry_request(method, url, attempt_headers, body, **kwargs)
+            
+            # Rotate to the next token ONLY on genuine budget/spend exhaustion.
+            # Request-level errors (bad or denied model, permission, auth,
+            # malformed body) are identical across every token in the pool, so
+            # rotating on them would needlessly poison the whole pool and surface
+            # a misleading "all tokens exhausted" error. Those are returned to the
+            # client unchanged so it sees the real upstream error.
             if self._response_is_spend_limited(response):
                 pool.mark_exhausted(token)
-                last_spend_response = response
+                logger.warning(
+                    "Token ...%s exhausted (budget), rotating to next token",
+                    token[-4:] if len(token) >= 4 else token,
+                )
+                last_error_response = response
                 continue
             return response
 
-        return self._all_tokens_exhausted_response(last_spend_response)
+        return self._all_tokens_exhausted_response(last_error_response)
 
 
 async def _log_toin_stats_periodically(interval_seconds: int = 300) -> None:
@@ -1992,6 +2096,44 @@ async def _log_toin_stats_periodically(interval_seconds: int = 300) -> None:
                 )
         except Exception as e:
             logger.debug("Failed to log TOIN stats: %s", e)
+
+
+def _cost_persistence_enabled() -> bool:
+    """Whether cost/token totals should be persisted across restarts.
+
+    Opt-in: only when a state location is explicitly configured via
+    ``HEADROOM_WORKSPACE_DIR`` (e.g. a mounted Docker volume) or
+    ``HEADROOM_COST_PATH``. This keeps the default (and tests) ephemeral —
+    matching the long-standing assumption that CostTracker is per-process —
+    while letting deployments turn on durable history. Disabled when stateless.
+    """
+    from headroom import paths as _hr_paths
+
+    if os.environ.get("HEADROOM_STATELESS", "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    return bool(
+        os.environ.get(_hr_paths.HEADROOM_COST_PATH_ENV, "").strip()
+        or os.environ.get(_hr_paths.HEADROOM_WORKSPACE_DIR_ENV, "").strip()
+    )
+
+
+async def _save_cost_state_periodically(
+    proxy: HeadroomProxy, interval_seconds: int = 60
+) -> None:
+    """Background task that snapshots cost/token totals to disk periodically.
+
+    A periodic flush (in addition to the shutdown save) means an abrupt kill
+    (e.g. ``docker kill``, OOM) only loses the last ``interval_seconds`` of
+    history rather than the whole run.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        if proxy.cost_tracker is None:
+            continue
+        try:
+            proxy.cost_tracker.save()
+        except Exception as e:
+            logger.debug("Failed to save cost state: %s", e)
 
 
 def _register_memory_components(proxy: HeadroomProxy, tracker: MemoryTracker) -> None:
@@ -2201,6 +2343,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 await proxy.startup()
                 if config.periodic_toin_stats_enabled:
                     asyncio.create_task(_log_toin_stats_periodically())
+                if proxy.cost_tracker is not None and _cost_persistence_enabled():
+                    asyncio.create_task(_save_cost_state_periodically(proxy))
                 if proxy.usage_reporter:
                     await proxy.usage_reporter.start(proxy)
                 if proxy.traffic_learner:
@@ -2864,7 +3008,31 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # see, so include it only for loopback callers; network callers get the
         # same body as /readyz (status + checks, no config). /livez and /readyz
         # remain the unauthenticated probes for orchestration health.
-        payload = _health_payload(include_config=_request_is_loopback(request))
+        _is_loopback = _request_is_loopback(request)
+        payload = _health_payload(include_config=_is_loopback)
+
+        # Auth-token pool health. This makes live upstream probe calls and
+        # exposes per-token detail, so it is loopback-only for the same reason
+        # as the config block — a network caller must not be able to trigger
+        # token probes or read pool state.
+        if _is_loopback and proxy.auth_token_pool and len(proxy.auth_token_pool) > 0:
+            try:
+                api_url = (
+                    proxy.config.anthropic_api_url
+                    or "https://api.nextgen-beta.ica.ibm.com/ica"
+                )
+                token_health = await proxy.auth_token_pool.check_all_tokens(api_url)
+                payload["auth_tokens"] = {
+                    "total": len(proxy.auth_token_pool),
+                    "healthy": sum(1 for t in token_health if t.get("healthy")),
+                    "tokens": token_health,
+                }
+            except Exception as e:
+                logger.warning("Failed to check auth token health: %s", e)
+                payload["auth_tokens"] = {
+                    "error": str(e),
+                }
+
         return JSONResponse(status_code=200, content=payload)
 
     # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
