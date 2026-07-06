@@ -45,6 +45,12 @@ set -euo pipefail
 
 IMAGE="${ICA_IMAGE:-headroom-ica:local}"
 PORT="${ICA_PROXY_PORT:-8787}"
+# Host interface the published port binds to. Defaults to loopback so the
+# container is reachable only from this machine; front it with a deliberate
+# forwarder (e.g. lan-forward) if you want LAN access. Set ICA_BIND_HOST=0.0.0.0
+# to publish on all interfaces (not recommended — it exposes the proxy + real
+# tokens to the whole network).
+BIND_HOST="${ICA_BIND_HOST:-127.0.0.1}"
 UPSTREAM_URL="${ICA_UPSTREAM_URL:-https://api.nextgen-beta.ica.ibm.com/ica}"
 TOKEN_FILE="${ICA_TOKEN_FILE:-$HOME/.headroom/ica_tokens.txt}"
 COOLDOWN="${ICA_TOKEN_COOLDOWN:-3600}"
@@ -68,7 +74,7 @@ n_tokens="$(grep -cvE '^\s*(#|$)' "$TOKEN_FILE" || true)"
 echo "Headroom → IBM ICA proxy (Docker)"
 echo "  image    : $IMAGE"
 echo "  upstream : $UPSTREAM_URL"
-echo "  listen   : http://localhost:$PORT"
+echo "  listen   : http://${BIND_HOST}:$PORT (bind host: $BIND_HOST)"
 echo "  keys     : $n_tokens (from $TOKEN_FILE, mounted read-only, cooldown ${COOLDOWN}s)"
 echo "  pricing  : \$${PRICE_INPUT}/1M in, \$${PRICE_OUTPUT}/1M out (flat; visible at /stats)"
 echo "  history  : volume '$DATA_VOLUME' → /data (survives re-deploy)"
@@ -82,7 +88,7 @@ docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 exec docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
-  -p "${PORT}:8787" \
+  -p "${BIND_HOST}:${PORT}:8787" \
   -v "${TOKEN_FILE}:${CONTAINER_TOKEN_PATH}:ro" \
   -v "${DATA_VOLUME}:/data" \
   -e HEADROOM_TELEMETRY=off \
