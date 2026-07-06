@@ -117,26 +117,34 @@ When a token has an error, the `error_type` field provides additional context:
 
 ## Usage Examples
 
+> **The `auth_tokens` block is loopback-only.** It is included only when the
+> `/health` caller is on loopback — this keeps token health private and stops
+> network callers from triggering the live per-token upstream probes. When the
+> proxy runs in Docker (or behind a LAN forwarder), the caller is not loopback,
+> so query `/health` from **inside the container** via `docker exec`. The
+> examples below use the container name `headroom-ica`.
+
 ### Check Token Health
 ```bash
-curl -s http://localhost:8787/health | jq '.auth_tokens'
+docker exec headroom-ica curl -s http://localhost:8787/health | jq '.auth_tokens'
 ```
 
 ### Monitor Healthy Token Count
 ```bash
-curl -s http://localhost:8787/health | jq '.auth_tokens.healthy'
+docker exec headroom-ica curl -s http://localhost:8787/health | jq '.auth_tokens.healthy'
 ```
 
 ### List All Token Statuses
 ```bash
-curl -s http://localhost:8787/health | jq '.auth_tokens.tokens[] | {id, status, healthy}'
+docker exec headroom-ica curl -s http://localhost:8787/health | jq '.auth_tokens.tokens[] | {id, status, healthy}'
 ```
 
 ### Alert on Low Healthy Tokens
 ```bash
 #!/bin/bash
-HEALTHY=$(curl -s http://localhost:8787/health | jq '.auth_tokens.healthy')
-TOTAL=$(curl -s http://localhost:8787/health | jq '.auth_tokens.total')
+HEALTH=$(docker exec headroom-ica curl -s http://localhost:8787/health)
+HEALTHY=$(echo "$HEALTH" | jq '.auth_tokens.healthy')
+TOTAL=$(echo "$HEALTH" | jq '.auth_tokens.total')
 
 if [ "$HEALTHY" -lt 2 ]; then
   echo "WARNING: Only $HEALTHY/$TOTAL tokens are healthy!"
