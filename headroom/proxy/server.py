@@ -3003,19 +3003,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.get("/health")
     async def health(request: Request):
         await _check_upstream()
-        # /health echoes upstream API URLs + backend config (the `config`
-        # block). That is operational detail an external scanner should not
-        # see, so include it only for loopback callers; network callers get the
-        # same body as /readyz (status + checks, no config). /livez and /readyz
-        # remain the unauthenticated probes for orchestration health.
-        _is_loopback = _request_is_loopback(request)
-        payload = _health_payload(include_config=_is_loopback)
+        # /health includes the backend `config` block and the auth-token pool
+        # health (per-key budget checks). The trust boundary for this fork's ICA
+        # deployment is the network bind, not a per-request peer check: the proxy
+        # is published on loopback only (see run-ica-docker.sh ICA_BIND_HOST and
+        # the lan-forward loopback bind), so callers are already local. A
+        # per-request loopback check does not work behind that forwarder anyway
+        # (the peer is the forwarder, never loopback), so both blocks are always
+        # included. /livez and /readyz stay minimal for orchestration probes.
+        payload = _health_payload(include_config=True)
 
-        # Auth-token pool health. This makes live upstream probe calls and
-        # exposes per-token detail, so it is loopback-only for the same reason
-        # as the config block — a network caller must not be able to trigger
-        # token probes or read pool state.
-        if _is_loopback and proxy.auth_token_pool and len(proxy.auth_token_pool) > 0:
+        # Auth-token pool health — key budget checks surfaced on /health.
+        if proxy.auth_token_pool and len(proxy.auth_token_pool) > 0:
             try:
                 api_url = (
                     proxy.config.anthropic_api_url

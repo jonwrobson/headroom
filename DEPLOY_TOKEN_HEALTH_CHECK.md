@@ -110,23 +110,18 @@ Auth-token rotation enabled: 3 token(s) from /home/nonroot/.headroom/ica_tokens.
 
 ### 6. Test the Health Endpoint
 
-> **Important — query `/health` from inside the container.** The `auth_tokens`
-> and `config` blocks are only included for **loopback** callers (this avoids
-> exposing token health / upstream URLs to network clients and prevents external
-> callers from triggering the live per-token upstream probes). Behind a LAN
-> forwarder or Docker port publish the caller is never loopback, so those blocks
-> are omitted. Run the check inside the container instead:
+> **Note:** `/health` includes the `auth_tokens` (per-key budget) and `config`
+> blocks for all callers. The trust boundary is the network bind — the proxy is
+> published on **loopback only** (`ICA_BIND_HOST=127.0.0.1`, and the LAN
+> forwarder binds `127.0.0.1`), so only this host can reach the endpoint.
 
 ```bash
-# Basic health check (in-container = loopback, so auth_tokens/config are included)
-docker exec headroom-ica curl -s http://localhost:8787/health | jq '.'
+# Basic health check
+curl -s http://localhost:8787/health | jq '.'
 
 # Check token health specifically
-docker exec headroom-ica curl -s http://localhost:8787/health | jq '.auth_tokens'
+curl -s http://localhost:8787/health | jq '.auth_tokens'
 ```
-
-(A plain `curl http://localhost:8787/health` from the host still returns
-`status`/`checks` for liveness — it just omits `auth_tokens` and `config`.)
 
 Expected response:
 ```json
@@ -184,8 +179,8 @@ docker logs headroom-ica | grep -i "auth-token"
 # Test connectivity from container
 docker exec headroom-ica curl -v https://api.nextgen-beta.ica.ibm.com/ica/v1/messages
 
-# Check if API URL is correct (config is loopback-only — query from inside the container)
-docker exec headroom-ica curl -s http://localhost:8787/health | jq '.config.anthropic_api_url'
+# Check if API URL is correct
+curl -s http://localhost:8787/health | jq '.config.anthropic_api_url'
 ```
 
 ### Token File Format Issues
@@ -236,10 +231,8 @@ docker run -d --name headroom-ica --restart unless-stopped \
 #!/bin/bash
 # check-token-health.sh
 
-# auth_tokens is loopback-only; run the probe inside the container.
-HEALTH=$(docker exec headroom-ica curl -s http://localhost:8787/health)
-HEALTHY=$(echo "$HEALTH" | jq '.auth_tokens.healthy')
-TOTAL=$(echo "$HEALTH" | jq '.auth_tokens.total')
+HEALTHY=$(curl -s http://localhost:8787/health | jq '.auth_tokens.healthy')
+TOTAL=$(curl -s http://localhost:8787/health | jq '.auth_tokens.total')
 
 if [ "$HEALTHY" -lt 2 ]; then
   echo "ALERT: Only $HEALTHY/$TOTAL tokens are healthy!"
