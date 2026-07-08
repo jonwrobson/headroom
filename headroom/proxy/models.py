@@ -282,6 +282,12 @@ class ProxyConfig:
     price_input_per_1m: float | None = None
     price_output_per_1m: float | None = None
 
+    # Model routing: map an incoming request ``model`` id to an upstream model
+    # id (see headroom/proxy/model_routing.py). Used for credit-point backends
+    # (e.g. IBM ICA) whose catalog uses fixed ids, so client-sent dated/legacy
+    # ids resolve to a real model. Empty/None = passthrough (today's behavior).
+    model_map: dict[str, str] | None = None
+
     # Logging
     log_requests: bool = True
     log_file: str | None = None

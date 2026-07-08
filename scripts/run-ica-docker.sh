@@ -56,6 +56,11 @@ TOKEN_FILE="${ICA_TOKEN_FILE:-$HOME/.headroom/ica_tokens.txt}"
 COOLDOWN="${ICA_TOKEN_COOLDOWN:-3600}"
 PRICE_INPUT="${ICA_PRICE_INPUT:-5}"
 PRICE_OUTPUT="${ICA_PRICE_OUTPUT:-25}"
+# Model routing: map the model ids Claude Code sends (incl. dated/legacy) to the
+# fixed ICA catalog so every picker selection resolves. Any haiku -> haiku-4-5,
+# any sonnet -> sonnet-5, opus 4.7/4.8 exact, any other opus -> opus-4-8.
+# Override with ICA_MODEL_MAP (JSON object or path to a JSON file).
+MODEL_MAP="${ICA_MODEL_MAP:-{\"haiku\":\"claude-haiku-4-5\",\"sonnet\":\"claude-sonnet-5\",\"opus-4-7\":\"claude-opus-4-7\",\"opus-4-8\":\"claude-opus-4-8\",\"opus\":\"claude-opus-4-8\"}}"
 DATA_VOLUME="${ICA_DATA_VOLUME:-headroom-ica-data}"
 CODE_AWARE="${ICA_CODE_AWARE:-1}"
 CONTAINER_NAME="headroom-ica"
@@ -77,6 +82,7 @@ echo "  upstream : $UPSTREAM_URL"
 echo "  listen   : http://${BIND_HOST}:$PORT (bind host: $BIND_HOST)"
 echo "  keys     : $n_tokens (from $TOKEN_FILE, mounted read-only, cooldown ${COOLDOWN}s)"
 echo "  pricing  : \$${PRICE_INPUT}/1M in, \$${PRICE_OUTPUT}/1M out (flat; visible at /stats)"
+echo "  model-map: $MODEL_MAP"
 echo "  history  : volume '$DATA_VOLUME' → /data (survives re-deploy)"
 echo "  code-aware: $([ "$CODE_AWARE" = "1" ] && echo enabled || echo disabled) (AST compression)"
 echo
@@ -95,6 +101,7 @@ exec docker run -d \
   -e HEADROOM_WORKSPACE_DIR=/data \
   -e HEADROOM_PRICE_INPUT_PER_1M="$PRICE_INPUT" \
   -e HEADROOM_PRICE_OUTPUT_PER_1M="$PRICE_OUTPUT" \
+  -e HEADROOM_MODEL_MAP="$MODEL_MAP" \
   -e HEADROOM_CODE_AWARE_ENABLED="$CODE_AWARE" \
   "$IMAGE" \
   --host 0.0.0.0 --port 8787 \

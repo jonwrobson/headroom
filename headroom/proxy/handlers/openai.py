@@ -30,6 +30,7 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.model_routing import resolve_model_id
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -1721,6 +1722,15 @@ class OpenAIHandlerMixin:
                 },
             )
         model = body.get("model", "unknown")
+        # Route the model id to an upstream model when a model_map is configured
+        # (e.g. IBM ICA fixed-catalog ids). No-op when unset. Rewrite the body so
+        # the forwarded request and all metrics use the resolved id.
+        if isinstance(model, str):
+            routed_model = resolve_model_id(model, self.config.model_map)
+            if routed_model != model:
+                model = routed_model
+                if isinstance(body.get("model"), str):
+                    body["model"] = routed_model
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
         input_event = self.pipeline_extensions.emit(

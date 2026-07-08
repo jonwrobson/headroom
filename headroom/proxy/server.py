@@ -144,6 +144,7 @@ from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
+from headroom.proxy.model_routing import parse_model_map
 from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
@@ -4458,6 +4459,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         ),
         auth_token_file=os.environ.get("HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE"),
         auth_token_cooldown_s=_get_env_int("HEADROOM_AUTH_TOKEN_COOLDOWN_S", 3600),
+        model_map=parse_model_map(os.environ.get("HEADROOM_MODEL_MAP")),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -5083,6 +5085,9 @@ if __name__ == "__main__":
             "HEADROOM_ANTHROPIC_AUTH_TOKEN_FILE", getattr(args, "auth_token_file", None)
         ),
         auth_token_cooldown_s=_get_env_int("HEADROOM_AUTH_TOKEN_COOLDOWN_S", 3600),
+        model_map=parse_model_map(
+            os.environ.get("HEADROOM_MODEL_MAP", getattr(args, "model_map", None))
+        ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]

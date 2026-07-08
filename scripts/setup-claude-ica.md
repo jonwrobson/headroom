@@ -124,6 +124,36 @@ Notes:
 Reload the VSCode window after editing settings, then run `/status` in the
 extension to confirm it is talking to the local proxy.
 
+## 4. Selecting models (model routing)
+
+ICA exposes a **fixed model catalog** (e.g. `claude-haiku-4-5`,
+`claude-sonnet-5`, `claude-opus-4-7`, `claude-opus-4-8`). Claude Code, however,
+sends its own ids — sometimes dated (`claude-haiku-4-5-20251001`) or legacy
+(`claude-3-5-sonnet-20241022`) — which are not in that catalog and would
+otherwise fail / land in the `unknown` cost bucket.
+
+The proxy routes the incoming model id to a catalog id via a **model map**
+(`--model-map` / `HEADROOM_MODEL_MAP`, a JSON object or a path to a JSON file).
+Resolution: exact match wins, else the longest map key that is a substring of
+the model id, else passthrough. The Docker helper (`run-ica-docker.sh`) sets a
+default map so every Claude tier resolves:
+
+```json
+{
+  "haiku":    "claude-haiku-4-5",
+  "sonnet":   "claude-sonnet-5",
+  "opus-4-7": "claude-opus-4-7",
+  "opus-4-8": "claude-opus-4-8",
+  "opus":     "claude-opus-4-8"
+}
+```
+
+So any Haiku → `claude-haiku-4-5`, any Sonnet → `claude-sonnet-5`, Opus 4.7/4.8
+map to themselves, and any other Opus → `claude-opus-4-8`. Override with
+`ICA_MODEL_MAP` (JSON string or file path). Pick a model in the VSCode model
+selector and it resolves through the map; confirm at `/stats` (`by_model`) that
+requests land under the resolved catalog id, not `unknown`.
+
 ## Configuration reference
 
 | Setting | CLI flag | Env var | Default |
@@ -133,6 +163,7 @@ extension to confirm it is talking to the local proxy.
 | Cooldown (s) | `--auth-token-cooldown` | `HEADROOM_AUTH_TOKEN_COOLDOWN_S` | 3600 |
 | Input price / 1M | `--price-input` | `HEADROOM_PRICE_INPUT_PER_1M` | unset (LiteLLM lookup) |
 | Output price / 1M | `--price-output` | `HEADROOM_PRICE_OUTPUT_PER_1M` | unset (LiteLLM lookup) |
+| Model map | `--model-map` | `HEADROOM_MODEL_MAP` | unset (passthrough); Docker helper sets a tier map |
 | Code-aware | `--code-aware` | `HEADROOM_CODE_AWARE_ENABLED=1` | disabled (needs `[code]` extra) |
 | State dir | — | `HEADROOM_WORKSPACE_DIR` | `~/.headroom` |
 

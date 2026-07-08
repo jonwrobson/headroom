@@ -10,6 +10,7 @@ import click
 
 from headroom import paths as _paths
 from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
+from headroom.proxy.model_routing import parse_model_map
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
@@ -517,6 +518,19 @@ def dashboard(port: int, no_open: bool) -> None:
         "Env: HEADROOM_PRICE_OUTPUT_PER_1M."
     ),
 )
+@click.option(
+    "--model-map",
+    default=None,
+    envvar="HEADROOM_MODEL_MAP",
+    help=(
+        "Route incoming request model ids to upstream model ids. Value is a "
+        "JSON object (or a path to a JSON file) of {incoming: upstream}. Exact "
+        "match wins, else the longest key that is a substring of the model id; "
+        "unmatched models pass through unchanged. Useful for credit-point "
+        "endpoints (e.g. IBM ICA) whose catalog uses fixed ids. "
+        "Env: HEADROOM_MODEL_MAP."
+    ),
+)
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
 # We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
@@ -917,6 +931,7 @@ def proxy(
     budget_period: str,
     price_input: float | None,
     price_output: float | None,
+    model_map: str | None,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1188,6 +1203,7 @@ def proxy(
         budget_period=cast(Literal["hourly", "daily", "monthly"], budget_period),
         price_input_per_1m=price_input,
         price_output_per_1m=price_output,
+        model_map=parse_model_map(model_map),
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).

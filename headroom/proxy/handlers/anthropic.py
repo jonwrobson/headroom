@@ -460,6 +460,7 @@ class AnthropicHandlerMixin:
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
         from headroom.providers.anthropic import sanitize_anthropic_model_id
+        from headroom.proxy.model_routing import resolve_model_id
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
@@ -631,10 +632,14 @@ class AnthropicHandlerMixin:
             model = (
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
+            # Route the model id to an upstream model when a model_map is
+            # configured (e.g. IBM ICA fixed-catalog ids). No-op when unset.
+            if isinstance(model, str):
+                model = resolve_model_id(model, self.config.model_map)
             body_model = body.get("model")
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
-                body_mutation_tracker.mark_mutated("sanitize_model_id")
+                body_mutation_tracker.mark_mutated("route_model")
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"
