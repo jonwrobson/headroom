@@ -117,3 +117,47 @@ class TestProxyConfigWiring:
         monkeypatch.delenv("HEADROOM_MODEL_MAP", raising=False)
         config = builder()
         assert config.model_map == {}
+
+
+class TestModelsAdvertising:
+    """GET /v1/models advertises the model_map targets in Anthropic format."""
+
+    def _client(self, model_map):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        from headroom.proxy.server import ProxyConfig, create_app
+
+        config = ProxyConfig(
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            log_requests=False,
+            model_map=model_map,
+        )
+        return TestClient(create_app(config))
+
+    def test_lists_distinct_map_targets_in_anthropic_format(self):
+        with self._client(ICA_MAP) as client:
+            resp = client.get("/v1/models")
+            assert resp.status_code == 200
+            body = resp.json()
+            ids = [m["id"] for m in body["data"]]
+            # Distinct upstream targets (dedup of map values), sorted.
+            assert ids == [
+                "claude-haiku-4-5",
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-sonnet-5",
+            ]
+            first = body["data"][0]
+            assert first["type"] == "model"
+            assert "display_name" in first and "created_at" in first
+            assert body["has_more"] is False
+
+    def test_get_model_returns_advertised_entry(self):
+        with self._client(ICA_MAP) as client:
+            resp = client.get("/v1/models/claude-opus-4-7")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["id"] == "claude-opus-4-7"
+            assert body["type"] == "model"

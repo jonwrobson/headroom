@@ -192,6 +192,64 @@ def _synthetic_models_list_response() -> Response:
     )
 
 
+# Static timestamp for advertised (synthesized) model entries. The value is
+# cosmetic — Anthropic clients only key off `id` — but the field is required,
+# so we use a fixed date rather than a wall-clock read.
+_ADVERTISED_MODEL_CREATED_AT = "2025-01-01T00:00:00Z"
+
+
+def _anthropic_display_name(model_id: str) -> str:
+    """Readable label for a model id, e.g. ``claude-opus-4-8`` -> ``Claude Opus 4.8``."""
+    words: list[str] = []
+    nums: list[str] = []
+    for part in model_id.split("-"):
+        if part.isdigit():
+            nums.append(part)
+        else:
+            words.append(part.upper() if part == "gpt" else part.capitalize())
+    name = " ".join(words)
+    if nums:
+        name = f"{name} {'.'.join(nums)}".strip()
+    return name or model_id
+
+
+def _advertised_model_ids(proxy: Any) -> list[str]:
+    """Distinct upstream model ids the proxy routes to (from ``model_map`` values).
+
+    These are the models worth advertising on ``/v1/models`` for a fixed-catalog
+    backend (e.g. IBM ICA): exactly the ids incoming requests resolve to. Empty
+    when no model map is configured, in which case advertising is skipped and the
+    normal upstream passthrough applies.
+    """
+    model_map = getattr(proxy.config, "model_map", None) or {}
+    return sorted({v for v in model_map.values() if isinstance(v, str) and v})
+
+
+def _anthropic_model_entry(model_id: str) -> dict[str, Any]:
+    return {
+        "type": "model",
+        "id": model_id,
+        "display_name": _anthropic_display_name(model_id),
+        "created_at": _ADVERTISED_MODEL_CREATED_AT,
+    }
+
+
+def _synthetic_anthropic_models_response(model_ids: list[str]) -> Response:
+    """Anthropic-format `/v1/models` list built from advertised ids."""
+    data = [_anthropic_model_entry(mid) for mid in model_ids]
+    payload = {
+        "data": data,
+        "has_more": False,
+        "first_id": data[0]["id"] if data else None,
+        "last_id": data[-1]["id"] if data else None,
+    }
+    return Response(
+        content=json.dumps(payload),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
 def _synthetic_model_get_response(model_id: str) -> Response:
     """OpenAI-compatible `/v1/models/{id}` payload."""
     if model_id not in _CHATGPT_AUTH_CODEX_MODELS:
@@ -807,6 +865,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if chatgpt_response is not None:
             return chatgpt_response
 
+        # Advertise the models this proxy routes to (from model_map) as an
+        # Anthropic-format list, so a client's model picker can list them. Only
+        # when a map is configured (e.g. IBM ICA); otherwise fall through to the
+        # upstream's own /models. Answered locally — no upstream call or auth.
+        advertised = _advertised_model_ids(proxy)
+        if advertised:
+            return _synthetic_anthropic_models_response(advertised)
+
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,
@@ -824,6 +890,16 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         )
         if chatgpt_response is not None:
             return chatgpt_response
+
+        # Mirror list_models: for an advertised (routed-to) id, answer locally in
+        # Anthropic format; otherwise fall through to the upstream passthrough.
+        advertised = _advertised_model_ids(proxy)
+        if advertised and model_id in advertised:
+            return Response(
+                content=json.dumps(_anthropic_model_entry(model_id)),
+                status_code=200,
+                headers={"content-type": "application/json"},
+            )
 
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
