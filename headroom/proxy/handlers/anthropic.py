@@ -634,27 +634,27 @@ class AnthropicHandlerMixin:
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
             original_model = model  # Track for stats/savings accounting
-            # Intelligent router: if enabled and user selected "router" virtual model,
-            # analyze the request and pick the best model tier.
-            if (
-                self.config.router_enabled
-                and isinstance(model, str)
-                and is_router_model(model)
-            ):
-                router_decision = await route_request(self, body)
-                original_model = model
-                model = router_decision.model_id
-                if router_decision.thinking_param():
-                    body["thinking"] = router_decision.thinking_param()
-                    body_mutation_tracker.mark_mutated("router_thinking")
-                logger.debug(
-                    f"Router: {original_model} -> {model} "
-                    f"({router_decision.reasoning})"
-                )
             # Route the model id to an upstream model when a model_map is
             # configured (e.g. IBM ICA fixed-catalog ids). No-op when unset.
             if isinstance(model, str):
                 model = resolve_model_id(model, self.config.model_map)
+            # Intelligent router: if enabled and user selected Haiku, analyze
+            # the request and pick the best model tier (might escalate to Sonnet/Opus).
+            # Explicit Sonnet/Opus/etc selections bypass the router.
+            if (
+                self.config.router_enabled
+                and isinstance(model, str)
+                and model == "claude-haiku-4-5"
+            ):
+                router_decision = await route_request(self, body)
+                original_model = model
+                model = router_decision.model_id
+                # Re-apply model_map to the router's chosen model (e.g., "sonnet" → "claude-sonnet-5")
+                model = resolve_model_id(model, self.config.model_map)
+                logger.debug(
+                    f"Router: {original_model} -> {model} "
+                    f"({router_decision.reasoning})"
+                )
             body_model = body.get("model")
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model

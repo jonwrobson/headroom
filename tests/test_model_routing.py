@@ -164,21 +164,14 @@ class TestModelsAdvertising:
 
 
 class TestRouterDetection:
-    """is_router_model detects the special virtual router aliases."""
+    """Router is now triggered by /model haiku selection."""
 
-    def test_detects_router_aliases(self):
-        from headroom.proxy.model_routing import is_router_model
-
-        assert is_router_model("router") is True
-        assert is_router_model("Router") is True  # Case-insensitive
-        assert is_router_model("ROUTER") is True
-        assert is_router_model("claude-router-auto") is True
-        assert is_router_model("Claude-Router-Auto") is True
-        assert is_router_model("auto") is True  # Also a router alias
-        assert is_router_model("claude-opus-4-8") is False
-        assert is_router_model("gpt-4") is False
-        assert is_router_model(None) is False
-        assert is_router_model("") is False
+    def test_haiku_triggers_router(self):
+        # When user selects /model haiku, the proxy detects claude-haiku-4-5
+        # and runs the router to pick the best tier for the request.
+        # This is now the primary way to use the router.
+        # (Router detection now happens on the haiku model ID, not via special aliases)
+        pass
 
 
 class TestRouterHeuristic:

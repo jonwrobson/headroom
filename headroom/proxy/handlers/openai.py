@@ -1724,22 +1724,6 @@ class OpenAIHandlerMixin:
             )
         model = body.get("model", "unknown")
         original_model = model  # Track for stats/savings accounting
-        # Intelligent router: if enabled and user selected "router" virtual model,
-        # analyze the request and pick the best model tier.
-        if (
-            self.config.router_enabled
-            and isinstance(model, str)
-            and is_router_model(model)
-        ):
-            router_decision = await route_request(self, body)
-            original_model = model
-            model = router_decision.model_id
-            if router_decision.thinking_param():
-                body["thinking"] = router_decision.thinking_param()
-            logger.debug(
-                f"Router: {original_model} -> {model} "
-                f"({router_decision.reasoning})"
-            )
         # Route the model id to an upstream model when a model_map is configured
         # (e.g. IBM ICA fixed-catalog ids). No-op when unset. Rewrite the body so
         # the forwarded request and all metrics use the resolved id.
@@ -1749,6 +1733,23 @@ class OpenAIHandlerMixin:
                 model = routed_model
                 if isinstance(body.get("model"), str):
                     body["model"] = routed_model
+        # Intelligent router: if enabled and user selected Haiku, analyze
+        # the request and pick the best model tier (might escalate to Sonnet/Opus).
+        # Explicit Sonnet/Opus/etc selections bypass the router.
+        if (
+            self.config.router_enabled
+            and isinstance(model, str)
+            and model == "claude-haiku-4-5"
+        ):
+            router_decision = await route_request(self, body)
+            original_model = model
+            model = router_decision.model_id
+            # Re-apply model_map to the router's chosen model (e.g., "sonnet" → "claude-sonnet-5")
+            model = resolve_model_id(model, self.config.model_map)
+            logger.debug(
+                f"Router: {original_model} -> {model} "
+                f"({router_decision.reasoning})"
+            )
         # Stash original_model for stats/cost tracking (downgrade savings).
         request.state.original_model = original_model
         messages = body.get("messages", [])
