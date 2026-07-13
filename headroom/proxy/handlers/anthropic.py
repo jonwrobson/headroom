@@ -460,7 +460,8 @@ class AnthropicHandlerMixin:
         from headroom.cache.compression_store import get_compression_store
         from headroom.ccr import CCRToolInjector
         from headroom.providers.anthropic import sanitize_anthropic_model_id
-        from headroom.proxy.model_routing import resolve_model_id
+        from headroom.proxy.model_routing import is_router_model, resolve_model_id
+        from headroom.proxy.model_router import route_request
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
@@ -632,6 +633,24 @@ class AnthropicHandlerMixin:
             model = (
                 sanitize_anthropic_model_id(raw_model) if isinstance(raw_model, str) else raw_model
             )
+            original_model = model  # Track for stats/savings accounting
+            # Intelligent router: if enabled and user selected "router" virtual model,
+            # analyze the request and pick the best model tier.
+            if (
+                self.config.router_enabled
+                and isinstance(model, str)
+                and is_router_model(model)
+            ):
+                router_decision = await route_request(self, body)
+                original_model = model
+                model = router_decision.model_id
+                if router_decision.thinking_param():
+                    body["thinking"] = router_decision.thinking_param()
+                    body_mutation_tracker.mark_mutated("router_thinking")
+                logger.debug(
+                    f"Router: {original_model} -> {model} "
+                    f"({router_decision.reasoning})"
+                )
             # Route the model id to an upstream model when a model_map is
             # configured (e.g. IBM ICA fixed-catalog ids). No-op when unset.
             if isinstance(model, str):
@@ -640,6 +659,8 @@ class AnthropicHandlerMixin:
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("route_model")
+            # Stash original_model for stats/cost tracking (downgrade savings).
+            request.state.original_model = original_model
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"

@@ -136,6 +136,7 @@ class RequestOutcome:
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    original_model: str | None = None  # Model before routing (for downgrade tracking)
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 

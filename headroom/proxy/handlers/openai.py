@@ -30,7 +30,8 @@ from headroom.proxy.helpers import (
     jitter_delay_ms,
 )
 from headroom.proxy.loopback_guard import is_loopback_host
-from headroom.proxy.model_routing import resolve_model_id
+from headroom.proxy.model_routing import is_router_model, resolve_model_id
+from headroom.proxy.model_router import route_request
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -1722,6 +1723,23 @@ class OpenAIHandlerMixin:
                 },
             )
         model = body.get("model", "unknown")
+        original_model = model  # Track for stats/savings accounting
+        # Intelligent router: if enabled and user selected "router" virtual model,
+        # analyze the request and pick the best model tier.
+        if (
+            self.config.router_enabled
+            and isinstance(model, str)
+            and is_router_model(model)
+        ):
+            router_decision = await route_request(self, body)
+            original_model = model
+            model = router_decision.model_id
+            if router_decision.thinking_param():
+                body["thinking"] = router_decision.thinking_param()
+            logger.debug(
+                f"Router: {original_model} -> {model} "
+                f"({router_decision.reasoning})"
+            )
         # Route the model id to an upstream model when a model_map is configured
         # (e.g. IBM ICA fixed-catalog ids). No-op when unset. Rewrite the body so
         # the forwarded request and all metrics use the resolved id.
@@ -1731,6 +1749,8 @@ class OpenAIHandlerMixin:
                 model = routed_model
                 if isinstance(body.get("model"), str):
                     body["model"] = routed_model
+        # Stash original_model for stats/cost tracking (downgrade savings).
+        request.state.original_model = original_model
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
         input_event = self.pipeline_extensions.emit(

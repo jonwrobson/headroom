@@ -161,3 +161,112 @@ class TestModelsAdvertising:
             body = resp.json()
             assert body["id"] == "claude-opus-4-7"
             assert body["type"] == "model"
+
+
+class TestRouterDetection:
+    """is_router_model detects the special virtual router aliases."""
+
+    def test_detects_router_aliases(self):
+        from headroom.proxy.model_routing import is_router_model
+
+        assert is_router_model("router") is True
+        assert is_router_model("Router") is True  # Case-insensitive
+        assert is_router_model("ROUTER") is True
+        assert is_router_model("claude-router-auto") is True
+        assert is_router_model("Claude-Router-Auto") is True
+        assert is_router_model("auto") is True  # Also a router alias
+        assert is_router_model("claude-opus-4-8") is False
+        assert is_router_model("gpt-4") is False
+        assert is_router_model(None) is False
+        assert is_router_model("") is False
+
+
+class TestRouterHeuristic:
+    """Heuristic classification without calling a model."""
+
+    def test_trivial_request(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        body = {
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-haiku-4-5"
+        assert decision.thinking_level is None
+        assert decision.confidence > 0.8
+
+    def test_complex_architectural_request(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "design an architecture for a microservices platform with database sharding "
+                    * 5,  # Long + architecture keyword
+                }
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-opus-4-8"
+        assert decision.confidence > 0.8
+
+    def test_code_with_iteration_uses_sonnet(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        body = {
+            "messages": [
+                {"role": "user", "content": "```python\ncode here\n```"},
+                {"role": "assistant", "content": "response"},
+                {"role": "user", "content": "fix it"},
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-sonnet-5"
+
+    def test_classifier_respects_never_downgrade(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        # Any classification (even heuristic) should never downgrade to Haiku
+        # if there's any complexity signal
+        body = {
+            "messages": [
+                {"role": "user", "content": "some medium-length prompt\n```python\nx = 1\n```"},
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        # Must be Sonnet or higher (never Haiku) because of code signal
+        if decision is not None:
+            assert decision.model_id in ("claude-sonnet-5", "claude-opus-4-8")
+
+
+class TestRouterThinkingParam:
+    """Router decision's thinking_param() method."""
+
+    def test_thinking_param_none_when_disabled(self):
+        from headroom.proxy.model_router import RouterDecision
+
+        decision = RouterDecision(
+            model_id="claude-haiku-4-5",
+            thinking_level=None,
+            reasoning="trivial",
+            confidence=0.95,
+        )
+        assert decision.thinking_param() is None
+
+    def test_thinking_param_disabled_for_ica(self):
+        from headroom.proxy.model_router import RouterDecision
+
+        # ICA doesn't support extended thinking, so all requests return None
+        decision = RouterDecision(
+            model_id="claude-opus-4-8",
+            thinking_level="high",
+            reasoning="complex",
+            confidence=0.85,
+        )
+        param = decision.thinking_param()
+        # ICA backend doesn't support thinking
+        assert param is None

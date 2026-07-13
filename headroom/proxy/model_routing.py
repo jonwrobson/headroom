@@ -16,6 +16,10 @@ Resolution order in :func:`resolve_model_id`:
   3. otherwise the model is returned unchanged (passthrough).
 
 An empty/absent map is always a no-op passthrough.
+
+This module also detects the special "router" virtual model id, which signals
+the proxy to analyze each request and intelligently route it to the best
+(cheapest) model capable of handling it well (see :mod:`headroom.proxy.model_router`).
 """
 
 from __future__ import annotations
@@ -26,7 +30,12 @@ import os
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["parse_model_map", "resolve_model_id"]
+__all__ = ["parse_model_map", "resolve_model_id", "is_router_model"]
+
+# Virtual model aliases for intelligent routing.
+# When the client sends any of these (e.g., `/model router`), the proxy
+# analyzes the request and routes it dynamically.
+_ROUTER_ALIASES = frozenset({"router", "claude-router-auto", "auto"})
 
 
 def parse_model_map(raw: str | None) -> dict[str, str]:
@@ -61,11 +70,25 @@ def parse_model_map(raw: str | None) -> dict[str, str]:
     return model_map
 
 
+def is_router_model(model: str | None) -> bool:
+    """Check if a model id is the special "router" virtual model.
+
+    When this returns True, the proxy should analyze the request and
+    dynamically route it to the best model, rather than using a static mapping.
+    """
+    if not model or not isinstance(model, str):
+        return False
+    return model.strip().lower() in _ROUTER_ALIASES
+
+
 def resolve_model_id(model: str, model_map: dict[str, str] | None) -> str:
     """Resolve ``model`` against ``model_map`` (see module docstring for order).
 
     Returns ``model`` unchanged when the map is empty, the model is not a
     string, or nothing matches.
+
+    Note: does not handle the special "router" virtual model — that is
+    detected by :func:`is_router_model` and routed separately.
     """
     if not model_map or not isinstance(model, str) or not model:
         return model

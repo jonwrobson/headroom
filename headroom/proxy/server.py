@@ -1745,6 +1745,13 @@ class HeadroomProxy(
         """
         from headroom.proxy.outcome import emit_request_outcome
 
+        # Populate original_model from request state if not already set
+        # (set by handlers when router/model routing is applied).
+        if outcome.original_model is None and hasattr(outcome, '_request'):
+            outcome.original_model = getattr(
+                getattr(outcome._request, 'state', None), 'original_model', None
+            )
+
         await emit_request_outcome(self, outcome)
 
     async def _next_request_id(self) -> str:

@@ -288,6 +288,18 @@ class ProxyConfig:
     # ids resolve to a real model. Empty/None = passthrough (today's behavior).
     model_map: dict[str, str] | None = None
 
+    # Intelligent request router: when enabled and the client selects the
+    # special "router" virtual model (e.g., `/model router`), the proxy
+    # analyzes each request and routes it to the cheapest model capable of
+    # handling it well, erring toward escalation when uncertain.
+    # CLI: --router/--no-router; env: HEADROOM_ROUTER_ENABLED.
+    router_enabled: bool = True
+
+    # Ceiling model for router: the tier used as (a) Opus's classification
+    # target when heuristics are uncertain, and (b) the baseline for
+    # computing savings. Default: "opus" (claude-opus-4-8).
+    router_ceiling_model: str = "opus"
+
     # Logging
     log_requests: bool = True
     log_file: str | None = None

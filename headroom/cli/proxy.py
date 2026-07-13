@@ -531,6 +531,19 @@ def dashboard(port: int, no_open: bool) -> None:
         "Env: HEADROOM_MODEL_MAP."
     ),
 )
+@click.option(
+    "--router/--no-router",
+    "router_enabled",
+    default=None,
+    envvar="HEADROOM_ROUTER_ENABLED",
+    help=(
+        "Enable intelligent request routing. When enabled and the client "
+        "selects the 'router' virtual model (e.g., `/model router`), the proxy "
+        "analyzes each request and routes it to the cheapest model capable of "
+        "handling it well, while erring toward escalation when uncertain. "
+        "Default: enabled. Env: HEADROOM_ROUTER_ENABLED."
+    ),
+)
 # Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
 # Pair of flags so users can override the env-var default in either direction.
 # We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
@@ -932,6 +945,7 @@ def proxy(
     price_input: float | None,
     price_output: float | None,
     model_map: str | None,
+    router_enabled: bool | None,
     code_aware_flag: bool | None,
     disable_kompress: bool,
     disable_kompress_fallback: bool,
@@ -1204,6 +1218,7 @@ def proxy(
         price_input_per_1m=price_input,
         price_output_per_1m=price_output,
         model_map=parse_model_map(model_map),
+        router_enabled=router_enabled if router_enabled is not None else True,
         # Code-aware compression resolution:
         # 1. Explicit --code-aware / --no-code-aware always wins.
         # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
