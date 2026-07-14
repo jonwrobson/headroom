@@ -123,6 +123,11 @@
                         @click="setViewMode('history')">
                     Historical
                 </button>
+                <button class="px-3 py-1.5 text-sm rounded-md transition-colors"
+                        :class="viewMode === 'router' ? 'bg-accent text-black' : 'text-gray-400 hover:text-gray-200'"
+                        @click="setViewMode('router')">
+                    Router
+                </button>
             </div>
             <template x-if="stats.anon_telemetry_shipping">
                 <div class="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-1"
@@ -1758,6 +1763,128 @@
                         <div class="text-lg text-gray-300 mb-2">No persisted savings history yet</div>
                         <div class="text-sm text-gray-500 max-w-2xl mx-auto">
                             Historical data is written locally after proxy requests save tokens. Keep using Headroom and this view will fill in automatically across restarts.
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </template>
+
+        <!-- Router Efficiency View -->
+        <template x-if="viewMode === 'router'">
+            <div class="space-y-6">
+                <template x-if="(stats.cost?.router?.total_requests || 0) > 0">
+                    <div class="space-y-6">
+                        <!-- Headline metrics -->
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-xs text-gray-500 mb-1">Requests routed</div>
+                                <div class="text-3xl font-light tabular-nums text-accent"
+                                     x-text="formatNumber(stats.cost?.router?.total_requests || 0)"></div>
+                            </div>
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-xs text-gray-500 mb-1">Cost efficiency</div>
+                                <div class="text-3xl font-light tabular-nums"
+                                     :class="(stats.cost?.router?.efficiency_pct || 0) > 50 ? 'text-emerald-400' : (stats.cost?.router?.efficiency_pct || 0) > 20 ? 'text-amber-400' : 'text-gray-300'"
+                                     x-text="(stats.cost?.router?.efficiency_pct || 0).toFixed(1) + '%'"></div>
+                                <div class="text-xs text-gray-500">saved vs. all-Opus</div>
+                            </div>
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-xs text-gray-500 mb-1">Downgrade rate</div>
+                                <div class="text-3xl font-light tabular-nums text-cyan-400"
+                                     x-text="(stats.cost?.router?.downgrade_rate_pct || 0).toFixed(1) + '%'"></div>
+                                <div class="text-xs text-gray-500">routed below ceiling</div>
+                            </div>
+                            <div class="bg-surface rounded-lg p-4 border border-border">
+                                <div class="text-xs text-gray-500 mb-1">Total saved</div>
+                                <div class="text-3xl font-light tabular-nums text-emerald-400"
+                                     x-text="'$' + formatCurrency(stats.cost?.router?.total_savings_usd || 0)"></div>
+                                <div class="text-xs text-gray-500">at real list prices</div>
+                            </div>
+                        </div>
+
+                        <!-- Cost comparison: ceiling vs actual -->
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-sm font-medium mb-4 text-gray-300">Cost vs. All-Opus Baseline</div>
+                            <div class="space-y-3">
+                                <div>
+                                    <div class="flex justify-between text-xs mb-1">
+                                        <span class="text-gray-400">If every request used Opus (ceiling)</span>
+                                        <span class="font-mono tabular-nums text-gray-300" x-text="'$' + formatCurrency(stats.cost?.router?.ceiling_cost_usd || 0)"></span>
+                                    </div>
+                                    <div class="h-2 rounded bg-gray-700"></div>
+                                </div>
+                                <div>
+                                    <div class="flex justify-between text-xs mb-1">
+                                        <span class="text-gray-400">Actual cost after routing</span>
+                                        <span class="font-mono tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.cost?.router?.actual_cost_usd || 0)"></span>
+                                    </div>
+                                    <div class="h-2 rounded bg-gray-700 overflow-hidden">
+                                        <div class="h-full bg-emerald-400"
+                                             :style="'width:' + Math.min(100, ((stats.cost?.router?.actual_cost_usd || 0) / (stats.cost?.router?.ceiling_cost_usd || 1) * 100)) + '%'"></div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="mt-3 text-xs text-gray-500">
+                                Savings are computed at real per-tier list prices (Opus $5/$25, Sonnet $2/$10, Haiku $1/$5 per Mtok). On a flat-rate backend these are notional.
+                            </div>
+                        </div>
+
+                        <!-- Routing distribution: downgrades vs escalations -->
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-sm font-medium mb-4 text-gray-300">Routing Decisions</div>
+                            <div class="flex gap-8">
+                                <div>
+                                    <div class="text-2xl font-light tabular-nums text-cyan-400" x-text="formatNumber(stats.cost?.router?.downgrades || 0)"></div>
+                                    <div class="text-xs text-gray-500">downgraded (below Opus)</div>
+                                </div>
+                                <div>
+                                    <div class="text-2xl font-light tabular-nums text-amber-400" x-text="formatNumber(stats.cost?.router?.escalations || 0)"></div>
+                                    <div class="text-xs text-gray-500">kept at Opus ceiling</div>
+                                </div>
+                            </div>
+                            <div class="mt-4 h-2 rounded bg-amber-400/40 overflow-hidden flex">
+                                <div class="h-full bg-cyan-400"
+                                     :style="'width:' + (stats.cost?.router?.downgrade_rate_pct || 0) + '%'"></div>
+                            </div>
+                        </div>
+
+                        <!-- Per-model breakdown -->
+                        <div class="bg-surface rounded-lg p-4 border border-border">
+                            <div class="text-sm font-medium mb-4 text-gray-300">By Chosen Model</div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-sm">
+                                    <thead>
+                                        <tr class="text-xs text-gray-500 text-left border-b border-border">
+                                            <th class="py-2 pr-4 font-medium">Model</th>
+                                            <th class="py-2 pr-4 font-medium text-right">Requests</th>
+                                            <th class="py-2 pr-4 font-medium text-right">Share</th>
+                                            <th class="py-2 pr-4 font-medium text-right">Tokens</th>
+                                            <th class="py-2 font-medium text-right">Saved</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <template x-for="[model, info] in Object.entries(stats.cost?.router?.by_model || {})" :key="model">
+                                            <tr class="border-b border-border/40 text-gray-300">
+                                                <td class="py-2 pr-4 font-mono text-xs" x-text="truncateModel(model)"></td>
+                                                <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(info.requests)"></td>
+                                                <td class="py-2 pr-4 text-right tabular-nums text-gray-400"
+                                                    x-text="((info.requests / (stats.cost?.router?.total_requests || 1)) * 100).toFixed(0) + '%'"></td>
+                                                <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(info.tokens)"></td>
+                                                <td class="py-2 text-right tabular-nums text-emerald-400" x-text="'$' + formatCurrency(info.savings_usd)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </template>
+
+                <template x-if="!((stats.cost?.router?.total_requests || 0) > 0)">
+                    <div class="bg-surface rounded-lg border border-border p-10 text-center">
+                        <div class="text-lg text-gray-300 mb-2">No router activity yet</div>
+                        <div class="text-sm text-gray-500 max-w-2xl mx-auto">
+                            Select <span class="font-mono text-accent">/model haiku</span> in Claude Code to enable smart routing. The router analyzes each request and picks the cheapest capable model; this view fills in as requests flow through.
                         </div>
                     </div>
                 </template>

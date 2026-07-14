@@ -660,12 +660,17 @@ class CostTracker:
         self._api_cache_write_1h_by_model: dict[str, int] = {}
         self._api_uncached_by_model: dict[str, int] = {}
 
-        # Router downgrade accounting: when the router picks a cheaper model
-        # than the ceiling (Opus), track how often and how much was saved,
-        # keyed by the target (chosen) model.
+        # Router accounting: every request the router acts on, keyed by the
+        # chosen (target) model — including ceiling (Opus) escalations at zero
+        # savings, for the routing distribution / efficiency view.
         self._downgrade_requests_by_model: dict[str, int] = {}
         self._downgrade_tokens_by_model: dict[str, int] = {}
         self._downgrade_savings_usd_by_model: dict[str, float] = {}
+        # Aggregate router efficiency counters.
+        self._router_ceiling_cost_usd: float = 0.0
+        self._router_actual_cost_usd: float = 0.0
+        self._router_downgrades: int = 0
+        self._router_escalations: int = 0
 
     def reset_runtime(self) -> None:
         """Reset in-memory cost/token counters for local test/debug use."""
@@ -683,6 +688,10 @@ class CostTracker:
         self._downgrade_requests_by_model.clear()
         self._downgrade_tokens_by_model.clear()
         self._downgrade_savings_usd_by_model.clear()
+        self._router_ceiling_cost_usd = 0.0
+        self._router_actual_cost_usd = 0.0
+        self._router_downgrades = 0
+        self._router_escalations = 0
 
     def record_downgrade(
         self,
@@ -691,16 +700,17 @@ class CostTracker:
         output_tokens: int,
         ceiling_model: str = "claude-opus-4-8",
     ) -> None:
-        """Record a router downgrade: request routed to a cheaper model.
+        """Record a router decision, keyed by the chosen (target) model.
 
-        Computes savings as the difference between what the request would have
-        cost at the ceiling model (Opus) vs. the actual (cheaper) model, using
-        real list-price rates from LiteLLM. Keyed by the target model.
+        Every request the router acts on is recorded — including escalations
+        that keep the ceiling model (Opus), which record zero savings but still
+        count toward the routing distribution needed for the efficiency view.
 
-        Uses list-price (not the flat ICA override) so the savings figure
-        reflects the real per-tier price difference the router captures.
+        Savings = ceiling cost minus the chosen model's cost at real list-price
+        rates from LiteLLM (not the flat ICA override), so the figure reflects
+        the genuine per-tier price difference the router captures.
         """
-        if not target_model or target_model == ceiling_model:
+        if not target_model:
             return
         ceiling_cost = self._list_price_cost(ceiling_model, input_tokens, output_tokens)
         actual_cost = self._list_price_cost(target_model, input_tokens, output_tokens)
@@ -716,6 +726,52 @@ class CostTracker:
         self._downgrade_savings_usd_by_model[target_model] = round(
             self._downgrade_savings_usd_by_model.get(target_model, 0.0) + savings, 6
         )
+        # Track ceiling baseline + tier classification for the efficiency view.
+        self._router_ceiling_cost_usd = round(
+            self._router_ceiling_cost_usd + ceiling_cost, 6
+        )
+        self._router_actual_cost_usd = round(
+            self._router_actual_cost_usd + actual_cost, 6
+        )
+        if target_model == ceiling_model:
+            self._router_escalations += 1
+        else:
+            self._router_downgrades += 1
+
+    def _router_stats(self) -> dict:
+        """Build the router efficiency block for stats()."""
+        by_model = {
+            m: {
+                "requests": self._downgrade_requests_by_model.get(m, 0),
+                "tokens": self._downgrade_tokens_by_model.get(m, 0),
+                "savings_usd": round(self._downgrade_savings_usd_by_model.get(m, 0.0), 4),
+            }
+            for m in self._downgrade_requests_by_model
+        }
+        total_requests = sum(self._downgrade_requests_by_model.values())
+        total_savings = sum(self._downgrade_savings_usd_by_model.values())
+        ceiling_cost = self._router_ceiling_cost_usd
+        actual_cost = self._router_actual_cost_usd
+        # Efficiency = fraction of the ceiling (all-Opus) cost that was saved.
+        efficiency_pct = (
+            round(total_savings / ceiling_cost * 100, 1) if ceiling_cost > 0 else 0.0
+        )
+        downgrade_rate = (
+            round(self._router_downgrades / total_requests * 100, 1)
+            if total_requests > 0
+            else 0.0
+        )
+        return {
+            "by_model": by_model,
+            "total_requests": total_requests,
+            "total_savings_usd": round(total_savings, 4),
+            "downgrades": self._router_downgrades,
+            "escalations": self._router_escalations,
+            "downgrade_rate_pct": downgrade_rate,
+            "ceiling_cost_usd": round(ceiling_cost, 4),
+            "actual_cost_usd": round(actual_cost, 4),
+            "efficiency_pct": efficiency_pct,
+        }
 
     def estimate_cost(
         self,
@@ -1055,25 +1111,11 @@ class CostTracker:
             "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),
             "cache_write_1h_tokens": sum(self._api_cache_write_1h_by_model.values()),
             "per_model": per_model,
-            # Router downgrade accounting: how often/how much the router saved
-            # by routing to a cheaper model than the ceiling (Opus), keyed by
-            # the chosen target model. Savings use real list-price rates.
-            "router": {
-                "by_model": {
-                    m: {
-                        "requests": self._downgrade_requests_by_model.get(m, 0),
-                        "tokens": self._downgrade_tokens_by_model.get(m, 0),
-                        "savings_usd": round(
-                            self._downgrade_savings_usd_by_model.get(m, 0.0), 4
-                        ),
-                    }
-                    for m in self._downgrade_requests_by_model
-                },
-                "total_requests": sum(self._downgrade_requests_by_model.values()),
-                "total_savings_usd": round(
-                    sum(self._downgrade_savings_usd_by_model.values()), 4
-                ),
-            },
+            # Router accounting: every request the router acted on, keyed by the
+            # chosen model. Includes escalations that kept the ceiling (Opus) at
+            # zero savings, so the routing distribution / efficiency view is
+            # complete. Savings use real list-price rates.
+            "router": self._router_stats(),
             # Total billed cost (input + output). Named `cost_with_headroom_usd`
             # for back-compat with the dashboard/session summary, which read this
             # key as "what you actually paid with Headroom in front".

@@ -281,12 +281,30 @@ class TestRouterDowngradeSavings:
         assert router["total_savings_usd"] == pytest.approx(0.08, abs=0.01)
         assert router["by_model"]["claude-haiku-4-5"]["requests"] == 1
 
-    def test_record_downgrade_noop_when_target_is_ceiling(self):
+    def test_ceiling_escalation_recorded_with_zero_savings(self):
+        from headroom.proxy.cost import CostTracker
+
+        # An escalation that keeps the ceiling (Opus) is still recorded — it
+        # counts toward the routing distribution but saves nothing.
+        ct = CostTracker(price_input_per_1m=5.0, price_output_per_1m=25.0)
+        ct.record_downgrade("claude-opus-4-8", 10000, 2000, ceiling_model="claude-opus-4-8")
+        router = ct.stats()["router"]
+        assert router["total_requests"] == 1
+        assert router["escalations"] == 1
+        assert router["downgrades"] == 0
+        assert router["total_savings_usd"] == 0.0
+
+    def test_efficiency_metrics(self):
         from headroom.proxy.cost import CostTracker
 
         ct = CostTracker(price_input_per_1m=5.0, price_output_per_1m=25.0)
-        ct.record_downgrade("claude-opus-4-8", 10000, 2000, ceiling_model="claude-opus-4-8")
-        assert ct.stats()["router"]["total_requests"] == 0
+        ct.record_downgrade("claude-haiku-4-5", 10000, 2000, ceiling_model="claude-opus-4-8")
+        ct.record_downgrade("claude-opus-4-8", 5000, 1000, ceiling_model="claude-opus-4-8")
+        router = ct.stats()["router"]
+        assert router["total_requests"] == 2
+        assert router["downgrade_rate_pct"] == 50.0
+        assert 0 < router["efficiency_pct"] <= 100
+        assert router["ceiling_cost_usd"] > router["actual_cost_usd"]
 
     @pytest.mark.asyncio
     async def test_funnel_records_router_request(self):
