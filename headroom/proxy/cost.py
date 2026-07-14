@@ -660,6 +660,13 @@ class CostTracker:
         self._api_cache_write_1h_by_model: dict[str, int] = {}
         self._api_uncached_by_model: dict[str, int] = {}
 
+        # Router downgrade accounting: when the router picks a cheaper model
+        # than the ceiling (Opus), track how often and how much was saved,
+        # keyed by the target (chosen) model.
+        self._downgrade_requests_by_model: dict[str, int] = {}
+        self._downgrade_tokens_by_model: dict[str, int] = {}
+        self._downgrade_savings_usd_by_model: dict[str, float] = {}
+
     def reset_runtime(self) -> None:
         """Reset in-memory cost/token counters for local test/debug use."""
         self._costs.clear()
@@ -673,6 +680,42 @@ class CostTracker:
         self._api_cache_write_5m_by_model.clear()
         self._api_cache_write_1h_by_model.clear()
         self._api_uncached_by_model.clear()
+        self._downgrade_requests_by_model.clear()
+        self._downgrade_tokens_by_model.clear()
+        self._downgrade_savings_usd_by_model.clear()
+
+    def record_downgrade(
+        self,
+        target_model: str,
+        input_tokens: int,
+        output_tokens: int,
+        ceiling_model: str = "claude-opus-4-8",
+    ) -> None:
+        """Record a router downgrade: request routed to a cheaper model.
+
+        Computes savings as the difference between what the request would have
+        cost at the ceiling model (Opus) vs. the actual (cheaper) model, using
+        real list-price rates from LiteLLM. Keyed by the target model.
+
+        Uses list-price (not the flat ICA override) so the savings figure
+        reflects the real per-tier price difference the router captures.
+        """
+        if not target_model or target_model == ceiling_model:
+            return
+        ceiling_cost = self._list_price_cost(ceiling_model, input_tokens, output_tokens)
+        actual_cost = self._list_price_cost(target_model, input_tokens, output_tokens)
+        savings = max(ceiling_cost - actual_cost, 0.0)
+        self._downgrade_requests_by_model[target_model] = (
+            self._downgrade_requests_by_model.get(target_model, 0) + 1
+        )
+        self._downgrade_tokens_by_model[target_model] = (
+            self._downgrade_tokens_by_model.get(target_model, 0)
+            + input_tokens
+            + output_tokens
+        )
+        self._downgrade_savings_usd_by_model[target_model] = round(
+            self._downgrade_savings_usd_by_model.get(target_model, 0.0) + savings, 6
+        )
 
     def estimate_cost(
         self,
@@ -729,6 +772,32 @@ class CostTracker:
         except Exception as e:
             logger.warning(f"Failed to get pricing for model {model}: {e}")
             return None
+
+    def _list_price_cost(
+        self, model: str, input_tokens: int, output_tokens: int
+    ) -> float:
+        """Cost at real list-price rates, ignoring any flat-pricing override.
+
+        Used for router downgrade savings so the figure reflects the genuine
+        per-tier price difference (Opus vs Haiku/Sonnet), not the flat ICA rate.
+        Falls back to 0.0 if LiteLLM pricing is unavailable.
+        """
+        litellm = _get_litellm_module()
+        if litellm is None:
+            return 0.0
+        try:
+            from headroom.pricing.litellm_pricing import resolve_litellm_model
+
+            resolved_model = resolve_litellm_model(model)
+            input_cost, output_cost = litellm.cost_per_token(
+                model=resolved_model,
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+            )
+            return float(input_cost + output_cost)
+        except Exception as e:
+            logger.debug(f"List-price lookup failed for {model}: {e}")
+            return 0.0
 
     def _prune_old_costs(self):
         """Remove cost entries older than retention period.
@@ -986,6 +1055,25 @@ class CostTracker:
             "cache_write_5m_tokens": sum(self._api_cache_write_5m_by_model.values()),
             "cache_write_1h_tokens": sum(self._api_cache_write_1h_by_model.values()),
             "per_model": per_model,
+            # Router downgrade accounting: how often/how much the router saved
+            # by routing to a cheaper model than the ceiling (Opus), keyed by
+            # the chosen target model. Savings use real list-price rates.
+            "router": {
+                "by_model": {
+                    m: {
+                        "requests": self._downgrade_requests_by_model.get(m, 0),
+                        "tokens": self._downgrade_tokens_by_model.get(m, 0),
+                        "savings_usd": round(
+                            self._downgrade_savings_usd_by_model.get(m, 0.0), 4
+                        ),
+                    }
+                    for m in self._downgrade_requests_by_model
+                },
+                "total_requests": sum(self._downgrade_requests_by_model.values()),
+                "total_savings_usd": round(
+                    sum(self._downgrade_savings_usd_by_model.values()), 4
+                ),
+            },
             # Total billed cost (input + output). Named `cost_with_headroom_usd`
             # for back-compat with the dashboard/session summary, which read this
             # key as "what you actually paid with Headroom in front".

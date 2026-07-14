@@ -136,7 +136,6 @@ class RequestOutcome:
     tags: dict[str, str] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
-    original_model: str | None = None  # Model before routing (for downgrade tracking)
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -387,6 +386,22 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
             output_tokens=outcome.output_tokens,
         )
+        # Router downgrade savings: if the intelligent router acted on this
+        # request, record the savings vs. the ceiling model (Opus). The router
+        # firing at all means the request could have paid the ceiling price, so
+        # whatever tier it chose, the delta vs. ceiling is the saving. Even if
+        # the router kept the cheapest tier (Haiku), that is still a saving
+        # relative to the Opus ceiling. record_downgrade no-ops if target ==
+        # ceiling.
+        router_pending = getattr(handler, "router_pending", None)
+        if router_pending is not None and outcome.request_id in router_pending:
+            ceiling_id = router_pending.pop(outcome.request_id)
+            cost_tracker.record_downgrade(
+                outcome.model,
+                outcome.optimized_tokens,
+                outcome.output_tokens,
+                ceiling_model=ceiling_id,
+            )
 
     # 3. Per-request log (optional). The ``client`` outcome field is
     #    copied into ``tags["client"]`` so the dashboard's existing

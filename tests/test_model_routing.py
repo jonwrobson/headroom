@@ -263,3 +263,101 @@ class TestRouterThinkingParam:
         param = decision.thinking_param()
         # ICA backend doesn't support thinking
         assert param is None
+
+
+class TestRouterDowngradeSavings:
+    """CostTracker.record_downgrade + the outcome funnel account for savings."""
+
+    def test_record_downgrade_uses_list_price_not_flat(self):
+        from headroom.proxy.cost import CostTracker
+
+        # Flat ICA pricing ($5/$25) — savings must still reflect real per-tier
+        # list prices (Opus $5/$25 vs Haiku $1/$5), not the flat override.
+        ct = CostTracker(price_input_per_1m=5.0, price_output_per_1m=25.0)
+        ct.record_downgrade("claude-haiku-4-5", 10000, 2000, ceiling_model="claude-opus-4-8")
+        router = ct.stats()["router"]
+        assert router["total_requests"] == 1
+        # Opus: 10k*$5/M + 2k*$25/M = $0.10; Haiku: 10k*$1/M + 2k*$5/M = $0.02
+        assert router["total_savings_usd"] == pytest.approx(0.08, abs=0.01)
+        assert router["by_model"]["claude-haiku-4-5"]["requests"] == 1
+
+    def test_record_downgrade_noop_when_target_is_ceiling(self):
+        from headroom.proxy.cost import CostTracker
+
+        ct = CostTracker(price_input_per_1m=5.0, price_output_per_1m=25.0)
+        ct.record_downgrade("claude-opus-4-8", 10000, 2000, ceiling_model="claude-opus-4-8")
+        assert ct.stats()["router"]["total_requests"] == 0
+
+    @pytest.mark.asyncio
+    async def test_funnel_records_router_request(self):
+        from collections import OrderedDict
+        from unittest.mock import AsyncMock
+
+        from headroom.proxy.cost import CostTracker
+        from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+
+        class FakeConfig:
+            router_ceiling_model = "opus"
+
+        class FakeHandler:
+            def __init__(self):
+                self.cost_tracker = CostTracker(
+                    price_input_per_1m=5.0, price_output_per_1m=25.0
+                )
+                self.router_pending = OrderedDict()
+                self.metrics = AsyncMock()
+                self.config = FakeConfig()
+
+        handler = FakeHandler()
+        # Router fired for r1, kept Haiku (trivial) — still saves vs Opus ceiling
+        handler.router_pending["r1"] = "claude-opus-4-8"
+        outcome = RequestOutcome(
+            request_id="r1",
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            original_tokens=10000,
+            optimized_tokens=10000,
+            attempted_input_tokens=10000,
+            tokens_saved=0,
+            output_tokens=2000,
+        )
+        await emit_request_outcome(handler, outcome)
+        router = handler.cost_tracker.stats()["router"]
+        assert router["total_requests"] == 1
+        assert router["total_savings_usd"] > 0
+        assert "r1" not in handler.router_pending  # popped after recording
+
+    @pytest.mark.asyncio
+    async def test_funnel_ignores_non_router_request(self):
+        from collections import OrderedDict
+        from unittest.mock import AsyncMock
+
+        from headroom.proxy.cost import CostTracker
+        from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
+
+        class FakeConfig:
+            router_ceiling_model = "opus"
+
+        class FakeHandler:
+            def __init__(self):
+                self.cost_tracker = CostTracker(
+                    price_input_per_1m=5.0, price_output_per_1m=25.0
+                )
+                self.router_pending = OrderedDict()
+                self.metrics = AsyncMock()
+                self.config = FakeConfig()
+
+        handler = FakeHandler()
+        # No router entry for this request — should not be counted
+        outcome = RequestOutcome(
+            request_id="r2",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            original_tokens=100,
+            optimized_tokens=100,
+            attempted_input_tokens=100,
+            tokens_saved=0,
+            output_tokens=50,
+        )
+        await emit_request_outcome(handler, outcome)
+        assert handler.cost_tracker.stats()["router"]["total_requests"] == 0

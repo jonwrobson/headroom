@@ -655,12 +655,15 @@ class AnthropicHandlerMixin:
                     f"Router: {original_model} -> {model} "
                     f"({router_decision.reasoning})"
                 )
+                # Register this request for downgrade-savings accounting in the
+                # outcome funnel (once real token counts are known). The router
+                # firing means the request could have paid the ceiling price;
+                # whatever tier it chose, the delta vs. ceiling is the saving.
+                self._register_router_request(request_id)
             body_model = body.get("model")
             if isinstance(body_model, str) and model != body_model:
                 body["model"] = model
                 body_mutation_tracker.mark_mutated("route_model")
-            # Stash original_model for stats/cost tracking (downgrade savings).
-            request.state.original_model = original_model
             messages = body.get("messages", [])
             pipeline_provider = provider_name
             pipeline_path = request.url.path if upstream_base_url else "/v1/messages"

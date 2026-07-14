@@ -446,6 +446,53 @@
             </div>
         </template>
 
+        <!-- Router Downgrade Savings -->
+        <template x-if="(stats.cost?.router?.total_requests || 0) > 0">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-3">
+                    <div class="text-sm font-medium text-gray-300">Smart Router Savings</div>
+                    <span class="text-xs text-gray-500 font-mono"
+                          x-text="formatNumber(stats.cost?.router?.total_requests || 0) + ' requests routed'"></span>
+                </div>
+                <div class="flex items-center gap-8 mb-4">
+                    <div>
+                        <div class="text-xs text-gray-500 mb-1">Total saved vs. Opus</div>
+                        <div class="text-2xl font-light tabular-nums text-emerald-400"
+                             x-text="'$' + formatCurrency(stats.cost?.router?.total_savings_usd || 0)"></div>
+                        <div class="text-xs text-gray-500">at real per-tier list prices</div>
+                    </div>
+                    <div>
+                        <div class="text-xs text-gray-500 mb-1">Requests downgraded</div>
+                        <div class="text-2xl font-light tabular-nums text-accent"
+                             x-text="formatNumber(stats.cost?.router?.total_requests || 0)"></div>
+                        <div class="text-xs text-gray-500">routed below the Opus ceiling</div>
+                    </div>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-xs text-gray-500 text-left">
+                                <th class="py-2 pr-4 font-medium">Routed to</th>
+                                <th class="py-2 pr-4 font-medium text-right">Requests</th>
+                                <th class="py-2 pr-4 font-medium text-right">Tokens</th>
+                                <th class="py-2 font-medium text-right">Saved</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <template x-for="[model, info] in Object.entries(stats.cost?.router?.by_model || {})" :key="model">
+                                <tr class="border-t border-border text-gray-300">
+                                    <td class="py-2 pr-4 font-mono text-xs" x-text="truncateModel(model)"></td>
+                                    <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(info.requests)"></td>
+                                    <td class="py-2 pr-4 text-right tabular-nums" x-text="formatNumber(info.tokens)"></td>
+                                    <td class="py-2 text-right tabular-nums text-emerald-400" x-text="'$' + formatCurrency(info.savings_usd)"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </template>
+
         <!-- Anthropic Subscription Window -->
         <template x-if="stats.subscription_window && stats.subscription_window.latest">
             <div class="bg-surface rounded-lg p-4 border border-border mb-6">

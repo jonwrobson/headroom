@@ -1723,7 +1723,6 @@ class OpenAIHandlerMixin:
                 },
             )
         model = body.get("model", "unknown")
-        original_model = model  # Track for stats/savings accounting
         # Route the model id to an upstream model when a model_map is configured
         # (e.g. IBM ICA fixed-catalog ids). No-op when unset. Rewrite the body so
         # the forwarded request and all metrics use the resolved id.
@@ -1750,8 +1749,10 @@ class OpenAIHandlerMixin:
                 f"Router: {original_model} -> {model} "
                 f"({router_decision.reasoning})"
             )
-        # Stash original_model for stats/cost tracking (downgrade savings).
-        request.state.original_model = original_model
+            # Register for downgrade-savings accounting in the outcome funnel.
+            self._register_router_request(request_id)
+            if isinstance(body.get("model"), str):
+                body["model"] = model
         messages = body.get("messages", [])
         original_client_messages = copy.deepcopy(messages)
         input_event = self.pipeline_extensions.emit(

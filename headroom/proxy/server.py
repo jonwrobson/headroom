@@ -34,6 +34,7 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
@@ -689,6 +690,10 @@ class HeadroomProxy(
             if config.cost_tracking_enabled
             else None
         )
+        # Requests the intelligent router acted on: request_id -> ceiling model
+        # id. Read back in the outcome funnel to record downgrade savings once
+        # real token counts are known. Bounded to avoid unbounded growth.
+        self.router_pending: OrderedDict[str, str] = OrderedDict()
         self.metrics = PrometheusMetrics(
             cost_tracker=self.cost_tracker,
             stateless=config.stateless,
@@ -1745,14 +1750,20 @@ class HeadroomProxy(
         """
         from headroom.proxy.outcome import emit_request_outcome
 
-        # Populate original_model from request state if not already set
-        # (set by handlers when router/model routing is applied).
-        if outcome.original_model is None and hasattr(outcome, '_request'):
-            outcome.original_model = getattr(
-                getattr(outcome._request, 'state', None), 'original_model', None
-            )
-
         await emit_request_outcome(self, outcome)
+
+    def _register_router_request(self, request_id: str) -> None:
+        """Mark a request as router-handled for downgrade-savings accounting.
+
+        Stores request_id -> ceiling model id; the outcome funnel pops it once
+        real token counts are known and records the savings vs. the ceiling.
+        Bounded to the most recent 4096 in-flight requests.
+        """
+        ceiling = getattr(self.config, "router_ceiling_model", "opus")
+        ceiling_id = "claude-opus-4-8" if ceiling in ("opus", "opus-4-8") else ceiling
+        self.router_pending[request_id] = ceiling_id
+        while len(self.router_pending) > 4096:
+            self.router_pending.popitem(last=False)
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
