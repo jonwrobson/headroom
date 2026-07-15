@@ -403,6 +403,21 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 ceiling_model=ceiling_id,
             )
 
+    # 2b. Per-key usage attribution. Credit the auth-token that served this
+    #     request with its real token count so the pool can spread load
+    #     least-consumed-first. Independent of the cost tracker.
+    token_usage_pending = getattr(handler, "token_usage_pending", None)
+    auth_token_pool = getattr(handler, "auth_token_pool", None)
+    if (
+        token_usage_pending is not None
+        and auth_token_pool is not None
+        and outcome.request_id in token_usage_pending
+    ):
+        token = token_usage_pending.pop(outcome.request_id)
+        auth_token_pool.record_usage(
+            token, outcome.optimized_tokens + outcome.output_tokens
+        )
+
     # 3. Per-request log (optional). The ``client`` outcome field is
     #    copied into ``tags["client"]`` so the dashboard's existing
     #    tag-based filtering surfaces per-harness slicing for free —

@@ -1165,6 +1165,10 @@ class StreamingMixin:
                     upstream_response = None
                     continue
             # Usable response (success or a non-budget error) — stop rotating.
+            # Credit this token for balancing once the outcome funnel knows the
+            # real token count.
+            if _pool_active:
+                self._register_token_usage(request_id, _pool_token)
             break
 
         # Every pooled token is over budget — tell the client we ran out. This

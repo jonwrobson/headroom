@@ -694,6 +694,10 @@ class HeadroomProxy(
         # id. Read back in the outcome funnel to record downgrade savings once
         # real token counts are known. Bounded to avoid unbounded growth.
         self.router_pending: OrderedDict[str, str] = OrderedDict()
+        # Auth-token that served each in-flight request: request_id -> token.
+        # Popped in the outcome funnel to credit the pool's per-key usage once
+        # real token counts are known (least-consumed balancing). Bounded.
+        self.token_usage_pending: OrderedDict[str, str] = OrderedDict()
         self.metrics = PrometheusMetrics(
             cost_tracker=self.cost_tracker,
             stateless=config.stateless,
@@ -1765,6 +1769,18 @@ class HeadroomProxy(
         while len(self.router_pending) > 4096:
             self.router_pending.popitem(last=False)
 
+    def _register_token_usage(self, request_id: str | None, token: str | None) -> None:
+        """Record which auth-token served ``request_id`` for per-key balancing.
+
+        The outcome funnel pops this to credit the pool's usage once real token
+        counts are known. Bounded to the most recent 4096 in-flight requests.
+        """
+        if not request_id or not token:
+            return
+        self.token_usage_pending[request_id] = token
+        while len(self.token_usage_pending) > 4096:
+            self.token_usage_pending.popitem(last=False)
+
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
         async with self._request_counter_lock:
@@ -2085,6 +2101,9 @@ class HeadroomProxy(
                 )
                 last_error_response = response
                 continue
+            # This token served the final response — credit it for balancing
+            # once the outcome funnel knows the real token count.
+            self._register_token_usage(kwargs.get("request_id"), token)
             return response
 
         return self._all_tokens_exhausted_response(last_error_response)
@@ -3040,6 +3059,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     or "https://api.nextgen-beta.ica.ibm.com/ica"
                 )
                 token_health = await proxy.auth_token_pool.check_all_tokens(api_url)
+                usage_by_id = proxy.auth_token_pool.usage_snapshot()
+                for entry in token_health:
+                    entry["usage_tokens"] = usage_by_id.get(entry.get("id"), 0)
                 payload["auth_tokens"] = {
                     "total": len(proxy.auth_token_pool),
                     "healthy": sum(1 for t in token_health if t.get("healthy")),

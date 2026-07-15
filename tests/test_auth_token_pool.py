@@ -78,6 +78,49 @@ class TestTokenPool:
         assert pool.current() == "c"
         assert pool.active_count() == 1
 
+    def test_current_is_least_consumed(self):
+        pool = TokenPool(["a", "b", "c"], cooldown_s=3600)
+        # All equal at 0 → file order, so "a".
+        assert pool.current() == "a"
+        # Load up "a"; now "b" (still 0) should win.
+        pool.record_usage("a", 1000)
+        assert pool.current() == "b"
+        # Load "b" past "a"; "c" is still 0 and wins.
+        pool.record_usage("b", 2000)
+        assert pool.current() == "c"
+        # Give "c" the most; least-consumed "a" (1000) comes back.
+        pool.record_usage("c", 5000)
+        assert pool.current() == "a"
+
+    def test_least_consumed_ties_keep_file_order(self):
+        pool = TokenPool(["a", "b"], cooldown_s=3600)
+        pool.record_usage("a", 500)
+        pool.record_usage("b", 500)
+        assert pool.current() == "a"
+
+    def test_least_consumed_skips_exhausted(self):
+        pool = TokenPool(["a", "b", "c"], cooldown_s=3600)
+        # "a" is least-consumed (0) but cooled down → least-consumed *active* wins.
+        pool.record_usage("c", 100)  # a=0(exhausted), b=0, c=100
+        pool.mark_exhausted("a")
+        assert pool.current() == "b"
+        pool.record_usage("b", 1000)  # active: b=1000, c=100 → c
+        assert pool.current() == "c"
+
+    def test_record_usage_unknown_token_is_noop(self):
+        pool = TokenPool(["a"], cooldown_s=3600)
+        pool.record_usage("not-in-pool", 999)
+        pool.record_usage("a", 0)
+        pool.record_usage("a", -5)
+        assert pool.usage_snapshot() == {"a": 0}
+
+    def test_usage_snapshot_accumulates(self):
+        pool = TokenPool(["a", "b"], cooldown_s=3600)
+        pool.record_usage("a", 10)
+        pool.record_usage("a", 5)
+        pool.record_usage("b", 7)
+        assert pool.usage_snapshot() == {"a": 15, "b": 7}
+
     def test_all_exhausted(self):
         pool = TokenPool(["a", "b"], cooldown_s=3600)
         assert pool.all_exhausted() is False

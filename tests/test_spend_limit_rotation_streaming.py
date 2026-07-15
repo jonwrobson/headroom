@@ -8,6 +8,7 @@ a real proxy or network.
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -70,6 +71,8 @@ def _make_streaming_proxy(tokens, cooldown=3600):
     proxy._parse_sse_usage_from_buffer = MagicMock(return_value=None)
     proxy.memory_handler = None
     proxy.auth_token_pool = TokenPool(tokens, cooldown_s=cooldown)
+    # Real proxies set this in __init__; the partial proxy above skips it.
+    proxy.token_usage_pending = OrderedDict()
     return proxy
 
 

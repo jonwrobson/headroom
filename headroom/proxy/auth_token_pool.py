@@ -188,6 +188,9 @@ class TokenPool:
         self._cooldown_s = cooldown_s
         # token string -> monotonic timestamp at which the cooldown expires
         self._exhausted: dict[str, float] = {}
+        # token string -> cumulative tokens (input+output) served, for
+        # least-consumed load balancing across the pool.
+        self._usage: dict[str, int] = {}
         self._lock = threading.Lock()
 
     @classmethod
@@ -220,13 +223,37 @@ class TokenPool:
         return False
 
     def current(self) -> str | None:
-        """First token not currently in cooldown, or ``None`` if all exhausted."""
+        """Least-consumed active token, or ``None`` if all are exhausted.
+
+        Load is spread across the pool: among tokens not currently in cooldown,
+        the one with the lowest cumulative usage (see :meth:`record_usage`) is
+        chosen. File order breaks ties, so at startup — when all usage is 0 —
+        this still begins at the first token, and the choice is deterministic.
+        """
         now = time.monotonic()
         with self._lock:
-            for token_info in self._tokens:
-                if self._active(token_info.token, now):
-                    return token_info.token
-            return None
+            active = [t for t in self._tokens if self._active(t.token, now)]
+            if not active:
+                return None
+            # min() is stable: equal-usage tokens keep file order.
+            return min(active, key=lambda t: self._usage.get(t.token, 0)).token
+
+    def record_usage(self, token: str, tokens: int) -> None:
+        """Credit ``token`` with ``tokens`` used (input+output), for balancing.
+
+        No-op for a token not in the pool (defensive) or a non-positive count.
+        """
+        if tokens <= 0:
+            return
+        with self._lock:
+            if not any(t.token == token for t in self._tokens):
+                return
+            self._usage[token] = self._usage.get(token, 0) + tokens
+
+    def usage_snapshot(self) -> dict[str, int]:
+        """Map of token id -> cumulative usage, for /health and tests."""
+        with self._lock:
+            return {t.id: self._usage.get(t.token, 0) for t in self._tokens}
 
     def mark_exhausted(self, token: str) -> None:
         """Mark ``token`` exhausted; it is skipped until cooldown or budget renewal.
