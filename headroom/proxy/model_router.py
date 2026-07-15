@@ -11,10 +11,41 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Planning intent — matched with word boundaries so prose like "explanation"
+# does not falsely escalate. All planning is routed to Opus.
+_PLANNING_RE = re.compile(
+    r"\b(plan|plans|planning|plan mode|implementation plan|step-by-step plan)\b"
+)
+
+
+def _extract_conversation_text(messages: list) -> str:
+    """Concatenate the human/assistant conversation text, lowercased.
+
+    Deliberately scopes to message content only — NOT the serialized body —
+    so planning/architecture keywords in tool definitions or the system prompt
+    (e.g. Claude Code's ExitPlanMode tool description) don't force every request
+    to Opus. Handles both string content and content-block lists.
+    """
+    parts: list[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    if isinstance(text, str):
+                        parts.append(text)
+    return "\n".join(parts).lower()
 
 
 @dataclass
@@ -75,6 +106,9 @@ def classify_request_heuristic(body: dict[str, Any]) -> RouterDecision | None:
 
     total_tokens = _estimate_message_tokens(messages)
     total_text = json.dumps(body).lower()
+    # Conversation text only (excludes tool defs / system prompt) — used for
+    # intent keywords so boilerplate doesn't force every request to Opus.
+    convo_text = _extract_conversation_text(messages)
 
     # Indicators of complexity
     has_code = "```" in total_text or "<code>" in total_text
@@ -94,32 +128,40 @@ def classify_request_heuristic(body: dict[str, Any]) -> RouterDecision | None:
     )
     is_multi_turn = len(messages) > 3
 
+    # Genuine architectural intent only — broad words like "design"/"pattern"/
+    # "refactor" appear in ordinary coding chatter and would over-escalate, so
+    # they are deliberately excluded (refactoring is implementation → Sonnet).
     architecture_keywords = [
         "architect",
-        "design",
-        "refactor",
+        "architecture",
         "migrate",
+        "migration",
         "rewrite",
-        "structure",
-        "pattern",
-        "framework",
+        "redesign",
         "strategic",
+        "system design",
     ]
     has_architecture_signal = any(
-        kw in total_text for kw in architecture_keywords
+        kw in convo_text for kw in architecture_keywords
     )
+
+    # All planning work goes to Opus. Word-boundary match so "explanation" and
+    # similar prose don't falsely trigger.
+    has_planning_signal = bool(_PLANNING_RE.search(convo_text))
 
     debug_keywords = ["debug", "error", "traceback", "stack trace", "issue", "bug"]
     has_debug_signal = any(kw in total_text for kw in debug_keywords)
 
-    # Check for architectural/complex indicators first (these are high-confidence)
-    if has_architecture_signal or (is_multi_turn and has_code and has_tool_use) or total_tokens > 2000:
-        # Complex: architectural keywords, multi-step code work, or very long
+    # Reserve Opus for planning and genuine architecture work only. Coding
+    # implementation — including large, multi-turn, tool-driven agentic loops —
+    # falls through to Sonnet below. Request size alone is context volume, not
+    # difficulty, so it is deliberately NOT an escalation signal.
+    if has_planning_signal or has_architecture_signal:
         return RouterDecision(
             model_id="claude-opus-4-8",
             thinking_level=None,  # ICA doesn't support thinking
-            reasoning=f"Complex request ({total_tokens} tokens, code={has_code}, "
-            f"tool_use={has_tool_use}, architecture={has_architecture_signal})",
+            reasoning=f"Planning/architecture (planning={has_planning_signal}, "
+            f"architecture={has_architecture_signal})",
             confidence=0.85,
         )
 

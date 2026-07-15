@@ -235,6 +235,81 @@ class TestRouterHeuristic:
         if decision is not None:
             assert decision.model_id in ("claude-sonnet-5", "claude-opus-4-8")
 
+    def test_large_coding_session_uses_sonnet(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        # Large, multi-turn, tool-driven coding loop with NO planning or
+        # architecture language must route to Sonnet — request size alone is
+        # context volume, not difficulty, and must not escalate to Opus.
+        filler = "implement the parser and handle the edge cases " * 200
+        body = {
+            "messages": [
+                {"role": "user", "content": f"```python\ndef f():\n    pass\n```\n{filler}"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Edit", "input": {}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                    ],
+                },
+                {"role": "user", "content": "now fix the failing test"},
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-sonnet-5"
+
+    def test_planning_request_uses_opus(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        body = {
+            "messages": [
+                {"role": "user", "content": "Make a plan to add authentication to the app."},
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-opus-4-8"
+
+    def test_explanation_prose_does_not_escalate_to_opus(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        # "explanation"/"explain" must NOT trip the planning word-boundary regex.
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Can you give me an explanation of how DNS resolution "
+                    "works? Please explain the steps.",
+                },
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is None or decision.model_id != "claude-opus-4-8"
+
+    def test_refactor_with_code_uses_sonnet(self):
+        from headroom.proxy.model_router import classify_request_heuristic
+
+        # "refactor" is implementation work now → Sonnet, no longer Opus.
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Refactor this function.\n```python\ndef f():\n    return 1\n```",
+                },
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "also rename it"},
+            ],
+        }
+        decision = classify_request_heuristic(body)
+        assert decision is not None
+        assert decision.model_id == "claude-sonnet-5"
+
 
 class TestRouterThinkingParam:
     """Router decision's thinking_param() method."""
